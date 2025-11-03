@@ -104,7 +104,7 @@ func main() {
 
 		defer resp.Body.Close()
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body) // 修复：使用 io.ReadAll 替代 ioutil.ReadAll
 		if err != nil {
 			fmt.Printf("无法读取响应体: %v\n", err)
 			return
@@ -136,7 +136,7 @@ func main() {
 		}
 		defer file.Close()
 
-		body, err := ioutil.ReadAll(file)
+		body, err := io.ReadAll(file) // 修复：使用 io.ReadAll 替代 ioutil.ReadAll
 		if err != nil {
 			fmt.Printf("无法读取文件: %v\n", err)
 			return
@@ -415,16 +415,6 @@ func readIPs(File string) ([]string, error) {
 		ips = append(ips, ip)
 	}
 	return ips, scanner.Err()
-}
-
-// inc函数实现ip地址自增
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
 }
 
 // 测速函数
