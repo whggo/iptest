@@ -93,25 +93,25 @@ jobs:
           - goos: windows
             goarch: arm64
             ext: ".exe"
-    outputs: # 添加作业输出
+    outputs:
       build_time: ${{ steps.set-build-time.outputs.BUILD_TIME }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 获取完整提交历史
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.20" # 根据你的需求设置Go版本
+          go-version: "1.20"
           cache: false
 
       - name: Create Release Assets Directory
         run: mkdir -p "${{ github.workspace }}/release_assets"
 
       - name: Set Build Time
-        id: set-build-time # 给步骤设置ID
+        id: set-build-time
         run: |
           build_time=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
           echo "BUILD_TIME=$build_time" >> $GITHUB_OUTPUT
@@ -119,10 +119,28 @@ jobs:
       - name: Build
         run: |
           echo "Building iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} from iptest.go..."
-          go build -o ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} iptest.go
+          
+          # 设置编译标志
+          if [ "${{ matrix.goos }}" = "linux" ] && [[ "${{ matrix.goarch }}" == "arm"* ]]; then
+            # 对于 Linux ARM 架构，使用完全静态编译
+            export CGO_ENABLED=0
+            export GOARM=7  # 对于 ARMv7 兼容性
+            go build -a -ldflags="-s -w -extldflags=-static" -o ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} iptest.go
+          elif [ "${{ matrix.goos }}" = "linux" ]; then
+            # 对于其他 Linux 架构，禁用 CGO
+            export CGO_ENABLED=0
+            go build -ldflags="-s -w" -o ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} iptest.go
+          else
+            # 对于非 Linux 系统，正常编译
+            go build -ldflags="-s -w" -o ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} iptest.go
+          fi
+          
+          # 验证文件类型
+          echo "文件类型信息:"
+          file ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}
         env:
-         GOARCH: ${{ matrix.goarch }}
-         GOOS: ${{ matrix.goos }} 
+          GOARCH: ${{ matrix.goarch }}
+          GOOS: ${{ matrix.goos }}
 
       - name: Generate SHA256
         run: |
@@ -164,6 +182,10 @@ jobs:
           body: |
             ## 多平台构建版本
             **构建时间:** ${{ needs.build.outputs.build_time }}
+
+            **重要提示:** 
+            - Linux ARM/ARM64 版本为完全静态编译，适用于 OpenWrt 等嵌入式系统
+            - 如果运行出现 "syntax error"，请重新下载或等待新的构建版本
 
             完整变更日志:  
             https://github.com/Kwisma/iptest/commits/${{ github.event.inputs.release_tag || github.ref_name }}
