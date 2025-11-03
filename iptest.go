@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -36,20 +35,20 @@ var (
 	speedTest    = flag.Int("speedtest", 5, "下载测速协程数量,设为0禁用测速")                                // 下载测速协程数量
 	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=500000000", "测速文件地址") // 测速文件地址
 	enableTLS    = flag.Bool("tls", true, "是否启用TLS")                                           // TLS是否启用
-	delay = flag.Int("delay", 0, "延迟阈值(ms)，默认为0禁用延迟过滤")                           // 默认0，禁用过滤
+	delay        = flag.Int("delay", 0, "延迟阈值(ms)，默认为0禁用延迟过滤")                               // 默认0，禁用过滤
 )
 
 type result struct {
 	ip          string        // IP地址
 	port        int           // 端口
 	dataCenter  string        // 数据中心
-	locCode    string        // 源IP位置
+	locCode     string        // 源IP位置
 	region      string        // 地区
 	city        string        // 城市
-	region_zh      string        // 地区
-	country        string        // 国家
-	city_zh      string        // 城市
-	emoji      string        // 国旗
+	region_zh   string        // 地区
+	country     string        // 国家
+	city_zh     string        // 城市
+	emoji       string        // 国旗
 	latency     string        // 延迟
 	tcpDuration time.Duration // TCP请求延迟
 }
@@ -60,16 +59,16 @@ type speedtestresult struct {
 }
 
 type location struct {
-	Iata   string  `json:"iata"`
-	Lat    float64 `json:"lat"`
-	Lon    float64 `json:"lon"`
-	Cca2   string  `json:"cca2"`
-	Region string  `json:"region"`
-	City   string  `json:"city"`
+	Iata      string  `json:"iata"`
+	Lat       float64 `json:"lat"`
+	Lon       float64 `json:"lon"`
+	Cca2      string  `json:"cca2"`
+	Region    string  `json:"region"`
+	City      string  `json:"city"`
 	Region_zh string  `json:"region_zh"`
 	Country   string  `json:"country"`
-	City_zh string  `json:"city_zh"`
-	Emoji   string  `json:"emoji"`
+	City_zh   string  `json:"city_zh"`
+	Emoji     string  `json:"emoji"`
 }
 
 // 尝试提升文件描述符的上限
@@ -212,9 +211,9 @@ func main() {
 
 			tcpDuration := time.Since(start)
 			if *delay > 0 && tcpDuration.Milliseconds() > int64(*delay) {
-			    return // 超过延迟阈值直接返回（仅在delay>0时生效）
+				return // 超过延迟阈值直接返回（仅在delay>0时生效）
 			}
- 			
+
 			start = time.Now()
 
 			client := http.Client{
@@ -308,7 +307,7 @@ func main() {
 	}
 	var results []speedtestresult
 	if *speedTest > 0 {
-	    fmt.Printf("找到符合条件的ip 共%d个\n", atomic.LoadInt32(&validCount))
+		fmt.Printf("找到符合条件的ip 共%d个\n", atomic.LoadInt32(&validCount))
 		fmt.Printf("开始测速\n")
 		var wg2 sync.WaitGroup
 		wg2.Add(*speedTest)
@@ -359,6 +358,13 @@ func main() {
 		return
 	}
 	defer file.Close()
+
+	// 写入UTF-8 BOM防止中文乱码
+	_, err = file.WriteString("\xEF\xBB\xBF")
+	if err != nil {
+		fmt.Printf("写入BOM时出现错误: %v\n", err)
+		return
+	}
 
 	writer := csv.NewWriter(file)
 	if *speedTest > 0 {
