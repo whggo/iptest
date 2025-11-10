@@ -23,11 +23,13 @@ import (
 )
 
 const (
-	requestURL      = "speed.cloudflare.com/cdn-cgi/trace" // 请求trace URL
-	timeout         = 1 * time.Second                      // 超时时间
-	maxDuration     = 2 * time.Second                      // 最大持续时间
-	airportCodesURL = "https://raw.githubusercontent.com/cloudflare/cf-ui/master/packages/colo-config/src/data.json"
-	airportCodesFile = "airport_codes.json"
+	requestURL        = "speed.cloudflare.com/cdn-cgi/trace" // 请求trace URL
+	timeout           = 1 * time.Second                      // 超时时间
+	maxDuration       = 2 * time.Second                      // 最大持续时间
+	cloudflareIPv4URL = "https://www.cloudflare.com/ips-v4/"
+	cloudflareIPv6URL = "https://www.cloudflare.com/ips-v6/"
+	cloudflareIPFile  = "Cloudflare.txt"
+	cloudflareIPv6File = "Cloudflare_ipv6.txt"
 )
 
 var (
@@ -42,18 +44,121 @@ var (
 	defaultPort  = 443                                                                       // 默认端口
 )
 
+// Cloudflare IPv6 地址段（内置）
+var cloudflareIPv6Ranges = []string{
+	// 主要地址段
+	"2400:cb00::/32",
+	"2606:4700::/32",
+	"2803:f800::/32",
+	"2405:b500::/32",
+	"2405:8100::/32",
+	"2a06:98c0::/29",
+	"2c0f:f248::/32",
+	
+	// 详细子网段
+	"2400:cb00:2049::/48",
+	"2400:cb00:f00e::/48",
+	"2606:4700:10::/48",
+	"2606:4700:130::/48",
+	"2606:4700:3000::/48",
+	"2606:4700:3001::/48",
+	"2606:4700:3002::/48",
+	"2606:4700:3003::/48",
+	"2606:4700:3004::/48",
+	"2606:4700:3005::/48",
+	"2606:4700:3006::/48",
+	"2606:4700:3007::/48",
+	"2606:4700:3008::/48",
+	"2606:4700:3009::/48",
+	"2606:4700:3010::/48",
+	"2606:4700:3011::/48",
+	"2606:4700:3012::/48",
+	"2606:4700:3013::/48",
+	"2606:4700:3014::/48",
+	"2606:4700:3015::/48",
+	"2606:4700:3016::/48",
+	"2606:4700:3017::/48",
+	"2606:4700:3018::/48",
+	"2606:4700:3019::/48",
+	"2606:4700:3020::/48",
+	"2606:4700:3021::/48",
+	"2606:4700:3022::/48",
+	"2606:4700:3023::/48",
+	"2606:4700:3024::/48",
+	"2606:4700:3025::/48",
+	"2606:4700:3026::/48",
+	"2606:4700:3027::/48",
+	"2606:4700:3028::/48",
+	"2606:4700:3029::/48",
+	"2606:4700:3030::/48",
+	"2606:4700:3031::/48",
+	"2606:4700:3032::/48",
+	"2606:4700:3033::/48",
+	"2606:4700:3034::/48",
+	"2606:4700:3035::/48",
+	"2606:4700:3036::/48",
+	"2606:4700:3037::/48",
+	"2606:4700:3038::/48",
+	"2606:4700:3039::/48",
+	"2606:4700:a0::/48",
+	"2606:4700:a1::/48",
+	"2606:4700:a8::/48",
+	"2606:4700:a9::/48",
+	"2606:4700:a::/48",
+	"2606:4700:b::/48",
+	"2606:4700:c::/48",
+	"2606:4700:d0::/48",
+	"2606:4700:d1::/48",
+	"2606:4700:d::/48",
+	"2606:4700:e0::/48",
+	"2606:4700:e1::/48",
+	"2606:4700:e2::/48",
+	"2606:4700:e3::/48",
+	"2606:4700:e4::/48",
+	"2606:4700:e5::/48",
+	"2606:4700:e6::/48",
+	"2606:4700:e7::/48",
+	"2606:4700:e::/48",
+	"2606:4700:f1::/48",
+	"2606:4700:f2::/48",
+	"2606:4700:f3::/48",
+	"2606:4700:f4::/48",
+	"2606:4700:f5::/48",
+	"2606:4700:f::/48",
+	"2803:f800:50::/48",
+	"2803:f800:51::/48",
+	"2a06:98c1:3100::/48",
+	"2a06:98c1:3101::/48",
+	"2a06:98c1:3102::/48",
+	"2a06:98c1:3103::/48",
+	"2a06:98c1:3104::/48",
+	"2a06:98c1:3105::/48",
+	"2a06:98c1:3106::/48",
+	"2a06:98c1:3107::/48",
+	"2a06:98c1:3108::/48",
+	"2a06:98c1:3109::/48",
+	"2a06:98c1:310a::/48",
+	"2a06:98c1:310b::/48",
+	"2a06:98c1:310c::/48",
+	"2a06:98c1:310d::/48",
+	"2a06:98c1:310e::/48",
+	"2a06:98c1:310f::/48",
+	"2a06:98c1:3120::/48",
+	"2a06:98c1:3121::/48",
+	"2a06:98c1:3122::/48",
+	"2a06:98c1:3123::/48",
+	"2a06:98c1:3200::/48",
+	"2a06:98c1:50::/48",
+	"2a06:98c1:51::/48",
+	"2a06:98c1:54::/48",
+	"2a06:98c1:58::/48",
+}
+
 // 机场码映射结构
 type AirportCode struct {
 	Name    string `json:"name"`
 	Region  string `json:"region"`
 	Country string `json:"country"`
-}
-
-// Cloudflare IP范围映射
-type CloudflareIPRange struct {
-	Prefixes []struct {
-		IPPrefix string `json:"ip_prefix"`
-	} `json:"prefixes"`
 }
 
 type result struct {
@@ -227,53 +332,118 @@ var airportCodes = map[string]AirportCode{
 func getCloudflareIPRanges() ([]string, error) {
 	fmt.Println("正在从Cloudflare官方获取IP范围...")
 	
-	// Cloudflare官方IP范围API
-	urls := []string{
-		"https://www.cloudflare.com/ips-v4",
-		"https://www.cloudflare.com/ips-v6",
-	}
-	
 	var allRanges []string
 	
-	for _, url := range urls {
-		resp, err := http.Get(url)
-		if err != nil {
-			return nil, fmt.Errorf("无法从 %s 获取IP范围: %v", url, err)
-		}
-		defer resp.Body.Close()
-		
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("无法读取响应: %v", err)
-		}
-		
-		scanner := bufio.NewScanner(strings.NewReader(string(body)))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line != "" {
-				allRanges = append(allRanges, line)
-			}
-		}
+	// 获取IPv4范围
+	ipv4Ranges, err := getIPRangesFromURL(cloudflareIPv4URL)
+	if err != nil {
+		return nil, fmt.Errorf("获取IPv4范围失败: %v", err)
+	}
+	allRanges = append(allRanges, ipv4Ranges...)
+	
+	// 获取IPv6范围
+	ipv6Ranges, err := getIPRangesFromURL(cloudflareIPv6URL)
+	if err != nil {
+		fmt.Printf("获取IPv6范围失败，使用内置IPv6范围: %v\n", err)
+		// 使用内置IPv6范围作为备选
+		allRanges = append(allRanges, cloudflareIPv6Ranges...)
+	} else {
+		allRanges = append(allRanges, ipv6Ranges...)
 	}
 	
-	fmt.Printf("成功获取 %d 个Cloudflare IP范围\n", len(allRanges))
+	// 保存到本地文件
+	if err := saveIPRangesToFile(allRanges, cloudflareIPFile); err != nil {
+		fmt.Printf("保存IP范围到文件失败: %v\n", err)
+	}
+	
+	fmt.Printf("成功获取 %d 个Cloudflare IP范围（IPv4: %d, IPv6: %d）\n", 
+		len(allRanges), len(ipv4Ranges), len(ipv6Ranges))
+	
 	return allRanges, nil
 }
 
-// 根据机场码获取对应的IP网段
-func getIPRangesByAirportCodes(codes []string) ([]string, error) {
-	// 首先获取所有Cloudflare IP范围
-	allRanges, err := getCloudflareIPRanges()
+// 从URL获取IP范围
+func getIPRangesFromURL(url string) ([]string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 	
-	// 由于Cloudflare官方API不直接提供机场码到IP的映射，
-	// 这里我们返回所有IP范围，在实际测试时通过colo字段过滤
-	fmt.Printf("已选择机场码: %v\n", codes)
-	fmt.Printf("获取到 %d 个Cloudflare IP范围，将在测试时进行机场码过滤\n", len(allRanges))
+	var ranges []string
+	scanner := bufio.NewScanner(strings.NewReader(string(body)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			ranges = append(ranges, line)
+		}
+	}
 	
-	return allRanges, nil
+	return ranges, nil
+}
+
+// 保存IP范围到文件
+func saveIPRangesToFile(ranges []string, filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	
+	for _, r := range ranges {
+		_, err := file.WriteString(r + "\n")
+		if err != nil {
+			return err
+		}
+	}
+	
+	fmt.Printf("已保存 %d 个IP范围到 %s\n", len(ranges), filename)
+	return nil
+}
+
+// 从本地文件读取IP范围
+func getIPRangesFromFile(filename string) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	
+	var ranges []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			ranges = append(ranges, line)
+		}
+	}
+	
+	return ranges, scanner.Err()
+}
+
+// 根据机场码获取对应的IP网段
+func getIPRangesByAirportCodes(codes []string) ([]string, error) {
+	// 首先尝试从本地文件读取
+	if _, err := os.Stat(cloudflareIPFile); err == nil {
+		fmt.Println("从本地文件读取Cloudflare IP范围...")
+		ranges, err := getIPRangesFromFile(cloudflareIPFile)
+		if err == nil && len(ranges) > 0 {
+			fmt.Printf("从本地文件读取到 %d 个IP范围\n", len(ranges))
+			return ranges, nil
+		}
+	}
+	
+	// 从Cloudflare官方获取
+	return getCloudflareIPRanges()
 }
 
 // 尝试提升文件描述符的上限
@@ -387,7 +557,7 @@ func main() {
 	// 如果指定了机场码，直接从Cloudflare获取对应IP范围
 	if *region != "" {
 		fmt.Printf("正在根据机场码 %v 获取Cloudflare IP范围...\n", selectedCodes)
-		ips, err = getIPRangesByAirportCodes(selectedCodes)
+		ipRanges, err := getIPRangesByAirportCodes(selectedCodes)
 		if err != nil {
 			fmt.Printf("获取Cloudflare IP范围失败: %v\n", err)
 			fmt.Println("回退到使用文件中的IP列表")
@@ -395,6 +565,11 @@ func main() {
 			if err != nil {
 				fmt.Printf("无法从文件中读取 IP: %v\n", err)
 				return
+			}
+		} else {
+			// 将IP范围转换为测试格式
+			for _, ipRange := range ipRanges {
+				ips = append(ips, fmt.Sprintf("%s %d", ipRange, defaultPort))
 			}
 		}
 	} else {
