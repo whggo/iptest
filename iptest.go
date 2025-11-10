@@ -378,86 +378,111 @@ func sampleIPsFromCIDR(cidr string) ([]string, error) {
 			ips = append(ips, ip.String())
 			inc(ip)
 		}
+		fmt.Printf("网段 %s 扩展为 %d 个IP\n", cidr, len(ips))
 	} else {
-		// 如果IP数量大于8000，随机采样8000个IP
+		// 如果IP数量大于8000，使用高效的随机采样算法
 		fmt.Printf("网段过大，随机采样 %d 个IP进行测试\n", maxIPsPerCIDR)
-		ips = make([]string, 0, maxIPsPerCIDR)
-		
-		// 使用map来确保IP不重复
-		ipSet := make(map[string]bool)
-		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		
-		for len(ipSet) < maxIPsPerCIDR {
-			// 生成随机IP
-			randomIP := generateRandomIP(ipnet, r)
-			if randomIP != nil && !ipSet[randomIP.String()] {
-				ipSet[randomIP.String()] = true
-				ips = append(ips, randomIP.String())
-			}
-		}
+		ips = efficientRandomSample(ipnet, maxIPsPerCIDR)
+		fmt.Printf("网段 %s 采样为 %d 个IP\n", cidr, len(ips))
 	}
 
 	return ips, nil
 }
 
-// 生成CIDR网段内的随机IP
-func generateRandomIP(ipnet *net.IPNet, r *rand.Rand) net.IP {
+// 高效的随机采样算法
+func efficientRandomSample(ipnet *net.IPNet, sampleSize int) []string {
 	ones, bits := ipnet.Mask.Size()
-	ipLen := len(ipnet.IP)
+	totalIPs := 1 << (bits - ones)
 	
-	// 创建新的IP
-	ip := make(net.IP, ipLen)
-	copy(ip, ipnet.IP)
+	// 如果采样数量接近总数，直接使用所有IP
+	if sampleSize >= totalIPs-10 {
+		return getAllIPsFromCIDR(ipnet)
+	}
 	
-	// 随机生成主机部分
-	for i := ones / 8; i < ipLen; i++ {
-		byteOffset := uint(i*8)
-		if byteOffset < uint(ones) {
-			// 网络部分，保持不变
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	ips := make([]string, 0, sampleSize)
+	
+	// 使用布隆过滤器风格的简单去重
+	seen := make(map[uint32]bool)
+	
+	for len(ips) < sampleSize {
+		// 生成随机偏移量
+		offset := r.Uint32() % uint32(totalIPs)
+		
+		// 跳过网络地址和广播地址
+		if offset == 0 || offset == uint32(totalIPs-1) {
 			continue
 		}
 		
-		// 主机部分，随机生成
-		remainingBits := uint(bits) - byteOffset
-		if remainingBits >= 8 {
-			ip[i] = byte(r.Intn(256))
-		} else {
-			mask := byte(1<<remainingBits - 1)
-			ip[i] = ipnet.IP[i] | byte(r.Intn(int(mask+1)))
+		// 检查是否已经选择过这个偏移量
+		if seen[offset] {
+			continue
+		}
+		seen[offset] = true
+		
+		// 根据偏移量计算IP
+		ip := calculateIPFromOffset(ipnet.IP, ipnet.Mask, offset)
+		if ip != nil {
+			ips = append(ips, ip.String())
+		}
+		
+		// 防止无限循环
+		if len(seen) >= totalIPs-2 {
+			break
 		}
 	}
 	
-	// 确保不是网络地址或广播地址
-	if isNetworkAddress(ip, ipnet) || isBroadcastAddress(ip, ipnet) {
-		return generateRandomIP(ipnet, r)
-	}
-	
-	return ip
+	return ips
 }
 
-// 检查是否是网络地址
-func isNetworkAddress(ip net.IP, ipnet *net.IPNet) bool {
-	network := ipnet.IP.Mask(ipnet.Mask)
-	return ip.Equal(network)
-}
-
-// 检查是否是广播地址
-func isBroadcastAddress(ip net.IP, ipnet *net.IPNet) bool {
-	// 对于IPv4，计算广播地址
-	if ip.To4() != nil {
-		broadcast := make(net.IP, len(ipnet.IP))
-		copy(broadcast, ipnet.IP)
-		
-		mask := ipnet.Mask
-		for i := 0; i < len(ipnet.IP); i++ {
-			broadcast[i] = ipnet.IP[i] | ^mask[i]
-		}
-		
-		return ip.Equal(broadcast)
+// 根据偏移量计算IP地址
+func calculateIPFromOffset(baseIP net.IP, mask net.IPMask, offset uint32) net.IP {
+	ip := make(net.IP, len(baseIP))
+	copy(ip, baseIP)
+	
+	// 对于IPv4
+	if len(ip) == net.IPv4len {
+		// 将偏移量加到IP上
+		val := uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+		val += offset
+		ip[0] = byte(val >> 24)
+		ip[1] = byte(val >> 16)
+		ip[2] = byte(val >> 8)
+		ip[3] = byte(val)
+		return ip
 	}
 	
-	// IPv6没有广播地址概念
-	return false
+	// 对于IPv6（简化处理，只采样少量）
+	if len(ip) == net.IPv6len {
+		// 简化：只在最后16位进行随机
+		ip[14] = byte(offset >> 8)
+		ip[15] = byte(offset)
+		return ip
+	}
+	
+	return nil
+}
+
+// 获取CIDR中的所有IP（用于小网段）
+func getAllIPsFromCIDR(ipnet *net.IPNet) []string {
+	var ips []string
+	ip := make(net.IP, len(ipnet.IP))
+	copy(ip, ipnet.IP)
+	
+	// 跳过网络地址
+	inc(ip)
+	
+	for ipnet.Contains(ip) {
+		ips = append(ips, ip.String())
+		inc(ip)
+	}
+	
+	// 移除最后一个（广播地址）
+	if len(ips) > 0 {
+		ips = ips[:len(ips)-1]
+	}
+	
+	return ips
 }
 
 // 尝试提升文件描述符的上限
@@ -540,7 +565,7 @@ func main() {
 		}
 	} else {
 		fmt.Println("本地 locations.json 已存在,无需重新下载")
-		file, err := os.Open("locations.json")
+		file, err := os.Open("locations.json)
 		if err != nil {
 			fmt.Printf("无法打开文件: %v\n", err)
 			return
@@ -594,7 +619,6 @@ func main() {
 					for _, ip := range sampledIPs {
 						ips = append(ips, fmt.Sprintf("%s %d", ip, defaultPort))
 					}
-					fmt.Printf("网段 %s 扩展为 %d 个IP\n", ipRange, len(sampledIPs))
 					totalIPs += len(sampledIPs)
 				} else {
 					// 单个IP地址
