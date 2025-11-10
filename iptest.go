@@ -565,7 +565,7 @@ func main() {
 		}
 	} else {
 		fmt.Println("本地 locations.json 已存在,无需重新下载")
-		file, err := os.Open("locations.json)
+		file, err := os.Open("locations.json")
 		if err != nil {
 			fmt.Printf("无法打开文件: %v\n", err)
 			return
