@@ -41,6 +41,7 @@ var (
 	enableTLS    = flag.Bool("tls", true, "是否启用TLS")                                           // TLS是否启用
 	delay        = flag.Int("delay", 0, "延迟阈值(ms)，默认为0禁用延迟过滤")                               // 默认0，禁用过滤
 	region       = flag.String("region", "", "机场码过滤，如HKG,LAX等，多个用逗号分隔")                     // 机场码过滤
+	sampleSize   = flag.Int("sample", 50, "从每个CIDR网段中随机测试的IP数量")                           // 从每个CIDR网段中随机测试的IP数量
 	defaultPort  = 443                                                                       // 默认端口
 )
 
@@ -54,104 +55,6 @@ var cloudflareIPv6Ranges = []string{
 	"2405:8100::/32",
 	"2a06:98c0::/29",
 	"2c0f:f248::/32",
-	
-	// 详细子网段
-	"2400:cb00:2049::/48",
-	"2400:cb00:f00e::/48",
-	"2606:4700:10::/48",
-	"2606:4700:130::/48",
-	"2606:4700:3000::/48",
-	"2606:4700:3001::/48",
-	"2606:4700:3002::/48",
-	"2606:4700:3003::/48",
-	"2606:4700:3004::/48",
-	"2606:4700:3005::/48",
-	"2606:4700:3006::/48",
-	"2606:4700:3007::/48",
-	"2606:4700:3008::/48",
-	"2606:4700:3009::/48",
-	"2606:4700:3010::/48",
-	"2606:4700:3011::/48",
-	"2606:4700:3012::/48",
-	"2606:4700:3013::/48",
-	"2606:4700:3014::/48",
-	"2606:4700:3015::/48",
-	"2606:4700:3016::/48",
-	"2606:4700:3017::/48",
-	"2606:4700:3018::/48",
-	"2606:4700:3019::/48",
-	"2606:4700:3020::/48",
-	"2606:4700:3021::/48",
-	"2606:4700:3022::/48",
-	"2606:4700:3023::/48",
-	"2606:4700:3024::/48",
-	"2606:4700:3025::/48",
-	"2606:4700:3026::/48",
-	"2606:4700:3027::/48",
-	"2606:4700:3028::/48",
-	"2606:4700:3029::/48",
-	"2606:4700:3030::/48",
-	"2606:4700:3031::/48",
-	"2606:4700:3032::/48",
-	"2606:4700:3033::/48",
-	"2606:4700:3034::/48",
-	"2606:4700:3035::/48",
-	"2606:4700:3036::/48",
-	"2606:4700:3037::/48",
-	"2606:4700:3038::/48",
-	"2606:4700:3039::/48",
-	"2606:4700:a0::/48",
-	"2606:4700:a1::/48",
-	"2606:4700:a8::/48",
-	"2606:4700:a9::/48",
-	"2606:4700:a::/48",
-	"2606:4700:b::/48",
-	"2606:4700:c::/48",
-	"2606:4700:d0::/48",
-	"2606:4700:d1::/48",
-	"2606:4700:d::/48",
-	"2606:4700:e0::/48",
-	"2606:4700:e1::/48",
-	"2606:4700:e2::/48",
-	"2606:4700:e3::/48",
-	"2606:4700:e4::/48",
-	"2606:4700:e5::/48",
-	"2606:4700:e6::/48",
-	"2606:4700:e7::/48",
-	"2606:4700:e::/48",
-	"2606:4700:f1::/48",
-	"2606:4700:f2::/48",
-	"2606:4700:f3::/48",
-	"2606:4700:f4::/48",
-	"2606:4700:f5::/48",
-	"2606:4700:f::/48",
-	"2803:f800:50::/48",
-	"2803:f800:51::/48",
-	"2a06:98c1:3100::/48",
-	"2a06:98c1:3101::/48",
-	"2a06:98c1:3102::/48",
-	"2a06:98c1:3103::/48",
-	"2a06:98c1:3104::/48",
-	"2a06:98c1:3105::/48",
-	"2a06:98c1:3106::/48",
-	"2a06:98c1:3107::/48",
-	"2a06:98c1:3108::/48",
-	"2a06:98c1:3109::/48",
-	"2a06:98c1:310a::/48",
-	"2a06:98c1:310b::/48",
-	"2a06:98c1:310c::/48",
-	"2a06:98c1:310d::/48",
-	"2a06:98c1:310e::/48",
-	"2a06:98c1:310f::/48",
-	"2a06:98c1:3120::/48",
-	"2a06:98c1:3121::/48",
-	"2a06:98c1:3122::/48",
-	"2a06:98c1:3123::/48",
-	"2a06:98c1:3200::/48",
-	"2a06:98c1:50::/48",
-	"2a06:98c1:51::/48",
-	"2a06:98c1:54::/48",
-	"2a06:98c1:58::/48",
 }
 
 // 机场码映射结构
@@ -446,6 +349,44 @@ func getIPRangesByAirportCodes(codes []string) ([]string, error) {
 	return getCloudflareIPRanges()
 }
 
+// 从CIDR网段中随机采样IP地址
+func sampleIPsFromCIDR(cidr string, sampleSize int) ([]string, error) {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, err
+	}
+
+	// 计算网段中的IP数量
+	ones, bits := ipnet.Mask.Size()
+	totalIPs := 1 << (bits - ones)
+	
+	// 对于大网段，限制采样数量
+	if totalIPs > sampleSize {
+		totalIPs = sampleSize
+	}
+
+	var ips []string
+	ip := make(net.IP, len(ipnet.IP))
+	copy(ip, ipnet.IP)
+
+	// 跳过网络地址
+	inc(ip)
+
+	for i := 0; i < totalIPs && ipnet.Contains(ip); i++ {
+		ips = append(ips, ip.String())
+		inc(ip)
+		
+		// 对于大网段，跳过一些IP以减少数量
+		if totalIPs > 1000 {
+			for j := 0; j < 10 && ipnet.Contains(ip); j++ {
+				inc(ip)
+			}
+		}
+	}
+
+	return ips, nil
+}
+
 // 尝试提升文件描述符的上限
 func increaseMaxOpenFiles() {
 	fmt.Println("正在尝试提升文件描述符的上限...")
@@ -554,7 +495,7 @@ func main() {
 	var ips []string
 	var err error
 
-	// 如果指定了机场码，直接从Cloudflare获取对应IP范围
+	// 如果指定了机场码，直接从Cloudflare获取对应IP范围并扩展
 	if *region != "" {
 		fmt.Printf("正在根据机场码 %v 获取Cloudflare IP范围...\n", selectedCodes)
 		ipRanges, err := getIPRangesByAirportCodes(selectedCodes)
@@ -567,9 +508,23 @@ func main() {
 				return
 			}
 		} else {
-			// 将IP范围转换为测试格式
+			// 将CIDR网段扩展为具体的IP地址进行测试
+			fmt.Printf("正在从 %d 个CIDR网段中采样IP地址...\n", len(ipRanges))
 			for _, ipRange := range ipRanges {
-				ips = append(ips, fmt.Sprintf("%s %d", ipRange, defaultPort))
+				if strings.Contains(ipRange, "/") {
+					sampledIPs, err := sampleIPsFromCIDR(ipRange, *sampleSize)
+					if err != nil {
+						fmt.Printf("扩展CIDR网段 %s 失败: %v\n", ipRange, err)
+						continue
+					}
+					for _, ip := range sampledIPs {
+						ips = append(ips, fmt.Sprintf("%s %d", ip, defaultPort))
+					}
+					fmt.Printf("网段 %s 扩展为 %d 个IP\n", ipRange, len(sampledIPs))
+				} else {
+					// 单个IP地址
+					ips = append(ips, fmt.Sprintf("%s %d", ipRange, defaultPort))
+				}
 			}
 		}
 	} else {
@@ -581,7 +536,7 @@ func main() {
 		}
 	}
 
-	fmt.Printf("总共需要测试 %d 个IP范围\n", len(ips))
+	fmt.Printf("总共需要测试 %d 个IP地址\n", len(ips))
 
 	var wg sync.WaitGroup
 	wg.Add(len(ips))
