@@ -36,7 +36,8 @@ var (
 	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=500000000", "测速文件地址") // 测速文件地址
 	enableTLS    = flag.Bool("tls", true, "是否启用TLS")                                           // TLS是否启用
 	delay        = flag.Int("delay", 0, "延迟阈值(ms)，默认为0禁用延迟过滤")                               // 默认0，禁用过滤
-	defaultPort  = 443 // 默认端口
+	region       = flag.String("region", "", "机场码过滤，如HKG,LAX等，多个用逗号分隔")                     // 机场码过滤
+	defaultPort  = 443                                                                       // 默认端口
 )
 
 type result struct {
@@ -153,6 +154,17 @@ func main() {
 	locationMap := make(map[string]location)
 	for _, loc := range locations {
 		locationMap[loc.Iata] = loc
+	}
+
+	// 解析机场码过滤
+	var regionFilter map[string]bool
+	if *region != "" {
+		regionFilter = make(map[string]bool)
+		regions := strings.Split(*region, ",")
+		for _, r := range regions {
+			regionFilter[strings.TrimSpace(strings.ToUpper(r))] = true
+		}
+		fmt.Printf("启用机场码过滤: %v\n", regions)
 	}
 
 	ips, err := readIPs(*File)
@@ -287,6 +299,14 @@ func main() {
 				if matches := regexp.MustCompile(`colo=([A-Z]+)[\s\S]*?loc=([A-Z]+)`).FindStringSubmatch(body.String()); len(matches) > 2 {
 					dataCenter := matches[1]
 					locCode := matches[2]
+					
+					// 机场码过滤
+					if regionFilter != nil {
+						if !regionFilter[dataCenter] {
+							return // 不在过滤列表中，直接返回
+						}
+					}
+					
 					loc, ok := locationMap[dataCenter]
 					// 记录通过延迟检查的有效IP
 					atomic.AddInt32(&validCount, 1)
