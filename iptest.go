@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -30,6 +31,7 @@ const (
 	cloudflareIPv6URL = "https://www.cloudflare.com/ips-v6/"
 	cloudflareIPFile  = "Cloudflare.txt"
 	cloudflareIPv6File = "Cloudflare_ipv6.txt"
+	maxIPsPerCIDR     = 8000 // 每个CIDR网段最大测试IP数量
 )
 
 var (
@@ -349,8 +351,8 @@ func getIPRangesByAirportCodes(codes []string) ([]string, error) {
 	return getCloudflareIPRanges()
 }
 
-// 从CIDR网段中随机采样IP地址
-func sampleIPsFromCIDR(cidr string, sampleSize int) ([]string, error) {
+// 从CIDR网段中智能采样IP地址
+func sampleIPsFromCIDR(cidr string) ([]string, error) {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return nil, err
@@ -360,31 +362,102 @@ func sampleIPsFromCIDR(cidr string, sampleSize int) ([]string, error) {
 	ones, bits := ipnet.Mask.Size()
 	totalIPs := 1 << (bits - ones)
 	
-	// 对于大网段，限制采样数量
-	if totalIPs > sampleSize {
-		totalIPs = sampleSize
-	}
+	fmt.Printf("网段 %s 包含 %d 个IP地址\n", cidr, totalIPs)
 
 	var ips []string
-	ip := make(net.IP, len(ipnet.IP))
-	copy(ip, ipnet.IP)
-
-	// 跳过网络地址
-	inc(ip)
-
-	for i := 0; i < totalIPs && ipnet.Contains(ip); i++ {
-		ips = append(ips, ip.String())
+	
+	if totalIPs <= maxIPsPerCIDR {
+		// 如果IP数量小于等于8000，测试所有IP
+		ip := make(net.IP, len(ipnet.IP))
+		copy(ip, ipnet.IP)
+		
+		// 跳过网络地址
 		inc(ip)
 		
-		// 对于大网段，跳过一些IP以减少数量
-		if totalIPs > 1000 {
-			for j := 0; j < 10 && ipnet.Contains(ip); j++ {
-				inc(ip)
+		for i := 0; i < totalIPs-2 && ipnet.Contains(ip); i++ {
+			ips = append(ips, ip.String())
+			inc(ip)
+		}
+	} else {
+		// 如果IP数量大于8000，随机采样8000个IP
+		fmt.Printf("网段过大，随机采样 %d 个IP进行测试\n", maxIPsPerCIDR)
+		ips = make([]string, 0, maxIPsPerCIDR)
+		
+		// 使用map来确保IP不重复
+		ipSet := make(map[string]bool)
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		
+		for len(ipSet) < maxIPsPerCIDR {
+			// 生成随机IP
+			randomIP := generateRandomIP(ipnet, r)
+			if randomIP != nil && !ipSet[randomIP.String()] {
+				ipSet[randomIP.String()] = true
+				ips = append(ips, randomIP.String())
 			}
 		}
 	}
 
 	return ips, nil
+}
+
+// 生成CIDR网段内的随机IP
+func generateRandomIP(ipnet *net.IPNet, r *rand.Rand) net.IP {
+	ones, bits := ipnet.Mask.Size()
+	ipLen := len(ipnet.IP)
+	
+	// 创建新的IP
+	ip := make(net.IP, ipLen)
+	copy(ip, ipnet.IP)
+	
+	// 随机生成主机部分
+	for i := ones / 8; i < ipLen; i++ {
+		byteOffset := uint(i*8)
+		if byteOffset < uint(ones) {
+			// 网络部分，保持不变
+			continue
+		}
+		
+		// 主机部分，随机生成
+		remainingBits := uint(bits) - byteOffset
+		if remainingBits >= 8 {
+			ip[i] = byte(r.Intn(256))
+		} else {
+			mask := byte(1<<remainingBits - 1)
+			ip[i] = ipnet.IP[i] | byte(r.Intn(int(mask+1)))
+		}
+	}
+	
+	// 确保不是网络地址或广播地址
+	if isNetworkAddress(ip, ipnet) || isBroadcastAddress(ip, ipnet) {
+		return generateRandomIP(ipnet, r)
+	}
+	
+	return ip
+}
+
+// 检查是否是网络地址
+func isNetworkAddress(ip net.IP, ipnet *net.IPNet) bool {
+	network := ipnet.IP.Mask(ipnet.Mask)
+	return ip.Equal(network)
+}
+
+// 检查是否是广播地址
+func isBroadcastAddress(ip net.IP, ipnet *net.IPNet) bool {
+	// 对于IPv4，计算广播地址
+	if ip.To4() != nil {
+		broadcast := make(net.IP, len(ipnet.IP))
+		copy(broadcast, ipnet.IP)
+		
+		mask := ipnet.Mask
+		for i := 0; i < len(ipnet.IP); i++ {
+			broadcast[i] = ipnet.IP[i] | ^mask[i]
+		}
+		
+		return ip.Equal(broadcast)
+	}
+	
+	// IPv6没有广播地址概念
+	return false
 }
 
 // 尝试提升文件描述符的上限
@@ -509,10 +582,11 @@ func main() {
 			}
 		} else {
 			// 将CIDR网段扩展为具体的IP地址进行测试
-			fmt.Printf("正在从 %d 个CIDR网段中采样IP地址...\n", len(ipRanges))
+			fmt.Printf("正在从 %d 个CIDR网段中扩展IP地址...\n", len(ipRanges))
+			totalIPs := 0
 			for _, ipRange := range ipRanges {
 				if strings.Contains(ipRange, "/") {
-					sampledIPs, err := sampleIPsFromCIDR(ipRange, *sampleSize)
+					sampledIPs, err := sampleIPsFromCIDR(ipRange)
 					if err != nil {
 						fmt.Printf("扩展CIDR网段 %s 失败: %v\n", ipRange, err)
 						continue
@@ -521,11 +595,14 @@ func main() {
 						ips = append(ips, fmt.Sprintf("%s %d", ip, defaultPort))
 					}
 					fmt.Printf("网段 %s 扩展为 %d 个IP\n", ipRange, len(sampledIPs))
+					totalIPs += len(sampledIPs)
 				} else {
 					// 单个IP地址
 					ips = append(ips, fmt.Sprintf("%s %d", ipRange, defaultPort))
+					totalIPs++
 				}
 			}
+			fmt.Printf("总共扩展出 %d 个IP地址进行测试\n", totalIPs)
 		}
 	} else {
 		// 使用文件中的IP列表
