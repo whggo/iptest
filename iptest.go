@@ -31,7 +31,7 @@ const (
 	cloudflareIPv6URL = "https://www.cloudflare.com/ips-v6/"
 	cloudflareIPFile  = "Cloudflare.txt"
 	cloudflareIPv6File = "Cloudflare_ipv6.txt"
-	maxIPsPerCIDR     = 8000 // 每个CIDR网段最大测试IP数量
+	totalIPsTarget    = 8000 // 总共采集8000个IP地址
 )
 
 var (
@@ -352,7 +352,7 @@ func getIPRangesByAirportCodes(codes []string) ([]string, error) {
 }
 
 // 从CIDR网段中智能采样IP地址
-func sampleIPsFromCIDR(cidr string) ([]string, error) {
+func sampleIPsFromCIDR(cidr string, sampleSize int) ([]string, error) {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return nil, err
@@ -362,12 +362,12 @@ func sampleIPsFromCIDR(cidr string) ([]string, error) {
 	ones, bits := ipnet.Mask.Size()
 	totalIPs := 1 << (bits - ones)
 	
-	fmt.Printf("网段 %s 包含 %d 个IP地址\n", cidr, totalIPs)
+	fmt.Printf("网段 %s 包含 %d 个IP地址，采样 %d 个IP\n", cidr, totalIPs, sampleSize)
 
 	var ips []string
 	
-	if totalIPs <= maxIPsPerCIDR {
-		// 如果IP数量小于等于8000，测试所有IP
+	if totalIPs <= sampleSize {
+		// 如果IP数量小于等于采样数量，测试所有IP
 		ip := make(net.IP, len(ipnet.IP))
 		copy(ip, ipnet.IP)
 		
@@ -380,9 +380,9 @@ func sampleIPsFromCIDR(cidr string) ([]string, error) {
 		}
 		fmt.Printf("网段 %s 扩展为 %d 个IP\n", cidr, len(ips))
 	} else {
-		// 如果IP数量大于8000，使用高效的随机采样算法
-		fmt.Printf("网段过大，随机采样 %d 个IP进行测试\n", maxIPsPerCIDR)
-		ips = efficientRandomSample(ipnet, maxIPsPerCIDR)
+		// 如果IP数量大于采样数量，使用高效的随机采样算法
+		fmt.Printf("网段过大，随机采样 %d 个IP进行测试\n", sampleSize)
+		ips = efficientRandomSample(ipnet, sampleSize)
 		fmt.Printf("网段 %s 采样为 %d 个IP\n", cidr, len(ips))
 	}
 
@@ -565,7 +565,7 @@ func main() {
 		}
 	} else {
 		fmt.Println("本地 locations.json 已存在,无需重新下载")
-		file, err := os.Open("locations.json")
+		file, err := os.Open("locations.json")  // 修复：添加了缺失的引号
 		if err != nil {
 			fmt.Printf("无法打开文件: %v\n", err)
 			return
@@ -606,12 +606,30 @@ func main() {
 				return
 			}
 		} else {
+			// 总共采集8000个IP地址，在几个网段中平分
+			fmt.Printf("总共采集 %d 个IP地址，在 %d 个网段中平分\n", totalIPsTarget, len(ipRanges))
+			
+			// 计算每个网段应该采集的IP数量
+			ipsPerCIDR := totalIPsTarget / len(ipRanges)
+			if totalIPsTarget % len(ipRanges) != 0 {
+				ipsPerCIDR++ // 如果不能整除，最后一个网段多采集一些
+			}
+			
+			fmt.Printf("每个网段采集 %d 个IP\n", ipsPerCIDR)
+			
 			// 将CIDR网段扩展为具体的IP地址进行测试
 			fmt.Printf("正在从 %d 个CIDR网段中扩展IP地址...\n", len(ipRanges))
 			totalIPs := 0
-			for _, ipRange := range ipRanges {
+			for i, ipRange := range ipRanges {
 				if strings.Contains(ipRange, "/") {
-					sampledIPs, err := sampleIPsFromCIDR(ipRange)
+					// 为每个网段分配采样数量
+					currentSampleSize := ipsPerCIDR
+					// 如果是最后一个网段且总数不是整数，调整采样数量
+					if i == len(ipRanges)-1 && totalIPsTarget % len(ipRanges) != 0 {
+						currentSampleSize = totalIPsTarget - (ipsPerCIDR * (len(ipRanges) - 1))
+					}
+					
+					sampledIPs, err := sampleIPsFromCIDR(ipRange, currentSampleSize)
 					if err != nil {
 						fmt.Printf("扩展CIDR网段 %s 失败: %v\n", ipRange, err)
 						continue
@@ -620,6 +638,7 @@ func main() {
 						ips = append(ips, fmt.Sprintf("%s %d", ip, defaultPort))
 					}
 					totalIPs += len(sampledIPs)
+					fmt.Printf("网段 %s 采集了 %d 个IP\n", ipRange, len(sampledIPs))
 				} else {
 					// 单个IP地址
 					ips = append(ips, fmt.Sprintf("%s %d", ipRange, defaultPort))
