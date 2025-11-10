@@ -29,13 +29,14 @@ const (
 )
 
 var (
-	File         = flag.String("file", "ip.txt", "IP地址文件名称,格式为 ip port ,就是IP和端口之间用空格隔开")       // IP地址文件名称
+	File         = flag.String("file", "ip.txt", "IP地址文件名称,格式为 ip 或 ip/掩码, 例如: 173.245.48.0/20") // IP地址文件名称
 	outFile      = flag.String("outfile", "ip.csv", "输出文件名称")                                  // 输出文件名称
 	maxThreads   = flag.Int("max", 100, "并发请求最大协程数")                                           // 最大协程数
 	speedTest    = flag.Int("speedtest", 5, "下载测速协程数量,设为0禁用测速")                                // 下载测速协程数量
 	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=500000000", "测速文件地址") // 测速文件地址
 	enableTLS    = flag.Bool("tls", true, "是否启用TLS")                                           // TLS是否启用
 	delay        = flag.Int("delay", 0, "延迟阈值(ms)，默认为0禁用延迟过滤")                               // 默认0，禁用过滤
+	defaultPort  = 443 // 默认端口
 )
 
 type result struct {
@@ -185,17 +186,22 @@ func main() {
 			}()
 
 			parts := strings.Fields(ip)
-			if len(parts) != 2 {
+			if len(parts) < 1 {
 				fmt.Printf("IP地址格式错误: %s\n", ip)
 				return
 			}
+			
 			ipAddr := parts[0]
-			portStr := parts[1]
-
-			port, err := strconv.Atoi(portStr)
-			if err != nil {
-				fmt.Printf("端口格式错误: %s\n", portStr)
-				return
+			port := defaultPort // 默认使用443端口
+			
+			// 如果提供了端口，则使用提供的端口
+			if len(parts) >= 2 {
+				portStr := parts[1]
+				if p, err := strconv.Atoi(portStr); err == nil {
+					port = p
+				} else {
+					fmt.Printf("端口格式错误: %s，使用默认端口 %d\n", portStr, defaultPort)
+				}
 			}
 
 			dialer := &net.Dialer{
@@ -386,6 +392,34 @@ func main() {
 	fmt.Printf("有效IP数量: %d | 成功将结果写入文件 %s，耗时 %d秒\n", atomic.LoadInt32(&validCount), *outFile, time.Since(startTime)/time.Second)
 }
 
+// 从CIDR格式解析IP地址范围
+func expandCIDR(cidr string) ([]string, error) {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []string
+	for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
+		ips = append(ips, ip.String())
+	}
+	// 移除网络地址和广播地址
+	if len(ips) > 2 {
+		return ips[1 : len(ips)-1], nil
+	}
+	return ips, nil
+}
+
+// IP地址递增
+func inc(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
+}
+
 // 从文件中读取IP地址和端口
 func readIPs(File string) ([]string, error) {
 	file, err := os.Open(File)
@@ -396,23 +430,49 @@ func readIPs(File string) ([]string, error) {
 	var ips []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
 		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			fmt.Printf("行格式错误: %s\n", line)
+		if len(parts) == 0 {
 			continue
 		}
+
 		ipAddr := parts[0]
-		portStr := parts[1]
-
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			fmt.Printf("端口格式错误: %s\n", portStr)
-			continue
+		
+		// 检查是否是CIDR格式
+		if strings.Contains(ipAddr, "/") {
+			expandedIPs, err := expandCIDR(ipAddr)
+			if err != nil {
+				fmt.Printf("CIDR格式错误: %s, 错误: %v\n", ipAddr, err)
+				continue
+			}
+			
+			// 如果有指定端口，使用指定端口，否则使用默认端口
+			port := defaultPort
+			if len(parts) >= 2 {
+				if p, err := strconv.Atoi(parts[1]); err == nil {
+					port = p
+				}
+			}
+			
+			for _, expandedIP := range expandedIPs {
+				ips = append(ips, fmt.Sprintf("%s %d", expandedIP, port))
+			}
+		} else {
+			// 单个IP地址
+			port := defaultPort
+			if len(parts) >= 2 {
+				if p, err := strconv.Atoi(parts[1]); err == nil {
+					port = p
+				} else {
+					fmt.Printf("端口格式错误: %s，使用默认端口 %d\n", parts[1], defaultPort)
+				}
+			}
+			ips = append(ips, fmt.Sprintf("%s %d", ipAddr, port))
 		}
-
-		ip := fmt.Sprintf("%s %d", ipAddr, port)
-		ips = append(ips, ip)
 	}
 	return ips, scanner.Err()
 }
