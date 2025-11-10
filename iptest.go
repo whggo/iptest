@@ -23,9 +23,11 @@ import (
 )
 
 const (
-	requestURL  = "speed.cloudflare.com/cdn-cgi/trace" // 请求trace URL
-	timeout     = 1 * time.Second                      // 超时时间
-	maxDuration = 2 * time.Second                      // 最大持续时间
+	requestURL      = "speed.cloudflare.com/cdn-cgi/trace" // 请求trace URL
+	timeout         = 1 * time.Second                      // 超时时间
+	maxDuration     = 2 * time.Second                      // 最大持续时间
+	airportCodesURL = "https://raw.githubusercontent.com/cloudflare/cf-ui/master/packages/colo-config/src/data.json"
+	airportCodesFile = "airport_codes.json"
 )
 
 var (
@@ -39,6 +41,20 @@ var (
 	region       = flag.String("region", "", "机场码过滤，如HKG,LAX等，多个用逗号分隔")                     // 机场码过滤
 	defaultPort  = 443                                                                       // 默认端口
 )
+
+// 机场码映射结构
+type AirportCode struct {
+	Name    string `json:"name"`
+	Region  string `json:"region"`
+	Country string `json:"country"`
+}
+
+// Cloudflare IP范围映射
+type CloudflareIPRange struct {
+	Prefixes []struct {
+		IPPrefix string `json:"ip_prefix"`
+	} `json:"prefixes"`
+}
 
 type result struct {
 	ip          string        // IP地址
@@ -73,6 +89,193 @@ type location struct {
 	Emoji     string  `json:"emoji"`
 }
 
+// Cloudflare 数据中心完整机场码映射
+var airportCodes = map[string]AirportCode{
+	// 亚太地区 - 中国及周边
+	"HKG": {"香港", "亚太", "中国香港"},
+	"TPE": {"台北", "亚太", "中国台湾"},
+	
+	// 亚太地区 - 日本
+	"NRT": {"东京成田", "亚太", "日本"},
+	"KIX": {"大阪", "亚太", "日本"},
+	"ITM": {"大阪伊丹", "亚太", "日本"},
+	"FUK": {"福冈", "亚太", "日本"},
+	
+	// 亚太地区 - 韩国
+	"ICN": {"首尔仁川", "亚太", "韩国"},
+	
+	// 亚太地区 - 东南亚
+	"SIN": {"新加坡", "亚太", "新加坡"},
+	"BKK": {"曼谷", "亚太", "泰国"},
+	"HAN": {"河内", "亚太", "越南"},
+	"SGN": {"胡志明市", "亚太", "越南"},
+	"MNL": {"马尼拉", "亚太", "菲律宾"},
+	"CGK": {"雅加达", "亚太", "印度尼西亚"},
+	"KUL": {"吉隆坡", "亚太", "马来西亚"},
+	"RGN": {"仰光", "亚太", "缅甸"},
+	"PNH": {"金边", "亚太", "柬埔寨"},
+	
+	// 亚太地区 - 南亚
+	"BOM": {"孟买", "亚太", "印度"},
+	"DEL": {"新德里", "亚太", "印度"},
+	"MAA": {"金奈", "亚太", "印度"},
+	"BLR": {"班加罗尔", "亚太", "印度"},
+	"HYD": {"海得拉巴", "亚太", "印度"},
+	"CCU": {"加尔各答", "亚太", "印度"},
+	
+	// 亚太地区 - 澳洲
+	"SYD": {"悉尼", "亚太", "澳大利亚"},
+	"MEL": {"墨尔本", "亚太", "澳大利亚"},
+	"BNE": {"布里斯班", "亚太", "澳大利亚"},
+	"PER": {"珀斯", "亚太", "澳大利亚"},
+	"AKL": {"奥克兰", "亚太", "新西兰"},
+	
+	// 北美地区 - 美国西海岸
+	"LAX": {"洛杉矶", "北美", "美国"},
+	"SJC": {"圣何塞", "北美", "美国"},
+	"SEA": {"西雅图", "北美", "美国"},
+	"SFO": {"旧金山", "北美", "美国"},
+	"PDX": {"波特兰", "北美", "美国"},
+	"SAN": {"圣地亚哥", "北美", "美国"},
+	"PHX": {"凤凰城", "北美", "美国"},
+	"LAS": {"拉斯维加斯", "北美", "美国"},
+	
+	// 北美地区 - 美国东海岸
+	"EWR": {"纽瓦克", "北美", "美国"},
+	"IAD": {"华盛顿", "北美", "美国"},
+	"BOS": {"波士顿", "北美", "美国"},
+	"PHL": {"费城", "北美", "美国"},
+	"ATL": {"亚特兰大", "北美", "美国"},
+	"MIA": {"迈阿密", "北美", "美国"},
+	"MCO": {"奥兰多", "北美", "美国"},
+	
+	// 北美地区 - 美国中部
+	"ORD": {"芝加哥", "北美", "美国"},
+	"DFW": {"达拉斯", "北美", "美国"},
+	"IAH": {"休斯顿", "北美", "美国"},
+	"DEN": {"丹佛", "北美", "美国"},
+	"MSP": {"明尼阿波利斯", "北美", "美国"},
+	"DTW": {"底特律", "北美", "美国"},
+	"STL": {"圣路易斯", "北美", "美国"},
+	"MCI": {"堪萨斯城", "北美", "美国"},
+	
+	// 北美地区 - 加拿大
+	"YYZ": {"多伦多", "北美", "加拿大"},
+	"YVR": {"温哥华", "北美", "加拿大"},
+	"YUL": {"蒙特利尔", "北美", "加拿大"},
+	
+	// 欧洲地区 - 西欧
+	"LHR": {"伦敦", "欧洲", "英国"},
+	"CDG": {"巴黎", "欧洲", "法国"},
+	"FRA": {"法兰克福", "欧洲", "德国"},
+	"AMS": {"阿姆斯特丹", "欧洲", "荷兰"},
+	"BRU": {"布鲁塞尔", "欧洲", "比利时"},
+	"ZRH": {"苏黎世", "欧洲", "瑞士"},
+	"VIE": {"维也纳", "欧洲", "奥地利"},
+	"MUC": {"慕尼黑", "欧洲", "德国"},
+	"DUS": {"杜塞尔多夫", "欧洲", "德国"},
+	"HAM": {"汉堡", "欧洲", "德国"},
+	
+	// 欧洲地区 - 南欧
+	"MAD": {"马德里", "欧洲", "西班牙"},
+	"BCN": {"巴塞罗那", "欧洲", "西班牙"},
+	"MXP": {"米兰", "欧洲", "意大利"},
+	"FCO": {"罗马", "欧洲", "意大利"},
+	"ATH": {"雅典", "欧洲", "希腊"},
+	"LIS": {"里斯本", "欧洲", "葡萄牙"},
+	
+	// 欧洲地区 - 北欧
+	"ARN": {"斯德哥尔摩", "欧洲", "瑞典"},
+	"CPH": {"哥本哈根", "欧洲", "丹麦"},
+	"OSL": {"奥斯陆", "欧洲", "挪威"},
+	"HEL": {"赫尔辛基", "欧洲", "芬兰"},
+	
+	// 欧洲地区 - 东欧
+	"WAW": {"华沙", "欧洲", "波兰"},
+	"PRG": {"布拉格", "欧洲", "捷克"},
+	"BUD": {"布达佩斯", "欧洲", "匈牙利"},
+	"OTP": {"布加勒斯特", "欧洲", "罗马尼亚"},
+	"SOF": {"索非亚", "欧洲", "保加利亚"},
+	
+	// 中东地区
+	"DXB": {"迪拜", "中东", "阿联酋"},
+	"TLV": {"特拉维夫", "中东", "以色列"},
+	"BAH": {"巴林", "中东", "巴林"},
+	"AMM": {"安曼", "中东", "约旦"},
+	"KWI": {"科威特", "中东", "科威特"},
+	"DOH": {"多哈", "中东", "卡塔尔"},
+	"MCT": {"马斯喀特", "中东", "阿曼"},
+	
+	// 南美地区
+	"GRU": {"圣保罗", "南美", "巴西"},
+	"GIG": {"里约热内卢", "南美", "巴西"},
+	"EZE": {"布宜诺斯艾利斯", "南美", "阿根廷"},
+	"BOG": {"波哥大", "南美", "哥伦比亚"},
+	"LIM": {"利马", "南美", "秘鲁"},
+	"SCL": {"圣地亚哥", "南美", "智利"},
+	
+	// 非洲地区
+	"JNB": {"约翰内斯堡", "非洲", "南非"},
+	"CPT": {"开普敦", "非洲", "南非"},
+	"CAI": {"开罗", "非洲", "埃及"},
+	"LOS": {"拉各斯", "非洲", "尼日利亚"},
+	"NBO": {"内罗毕", "非洲", "肯尼亚"},
+	"ACC": {"阿克拉", "非洲", "加纳"},
+}
+
+// 从Cloudflare官方获取IP范围
+func getCloudflareIPRanges() ([]string, error) {
+	fmt.Println("正在从Cloudflare官方获取IP范围...")
+	
+	// Cloudflare官方IP范围API
+	urls := []string{
+		"https://www.cloudflare.com/ips-v4",
+		"https://www.cloudflare.com/ips-v6",
+	}
+	
+	var allRanges []string
+	
+	for _, url := range urls {
+		resp, err := http.Get(url)
+		if err != nil {
+			return nil, fmt.Errorf("无法从 %s 获取IP范围: %v", url, err)
+		}
+		defer resp.Body.Close()
+		
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("无法读取响应: %v", err)
+		}
+		
+		scanner := bufio.NewScanner(strings.NewReader(string(body)))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line != "" {
+				allRanges = append(allRanges, line)
+			}
+		}
+	}
+	
+	fmt.Printf("成功获取 %d 个Cloudflare IP范围\n", len(allRanges))
+	return allRanges, nil
+}
+
+// 根据机场码获取对应的IP网段
+func getIPRangesByAirportCodes(codes []string) ([]string, error) {
+	// 首先获取所有Cloudflare IP范围
+	allRanges, err := getCloudflareIPRanges()
+	if err != nil {
+		return nil, err
+	}
+	
+	// 由于Cloudflare官方API不直接提供机场码到IP的映射，
+	// 这里我们返回所有IP范围，在实际测试时通过colo字段过滤
+	fmt.Printf("已选择机场码: %v\n", codes)
+	fmt.Printf("获取到 %d 个Cloudflare IP范围，将在测试时进行机场码过滤\n", len(allRanges))
+	
+	return allRanges, nil
+}
+
 // 尝试提升文件描述符的上限
 func increaseMaxOpenFiles() {
 	fmt.Println("正在尝试提升文件描述符的上限...")
@@ -95,6 +298,28 @@ func main() {
 		increaseMaxOpenFiles()
 	}
 
+	// 解析机场码过滤
+	var regionFilter map[string]bool
+	var selectedCodes []string
+	if *region != "" {
+		regionFilter = make(map[string]bool)
+		regions := strings.Split(*region, ",")
+		for _, r := range regions {
+			code := strings.TrimSpace(strings.ToUpper(r))
+			if _, exists := airportCodes[code]; exists {
+				regionFilter[code] = true
+				selectedCodes = append(selectedCodes, code)
+				fmt.Printf("已选择机场: %s - %s\n", code, airportCodes[code].Name)
+			} else {
+				fmt.Printf("警告: 未知的机场码 %s，已跳过\n", code)
+			}
+		}
+		if len(regionFilter) == 0 {
+			fmt.Println("错误: 没有有效的机场码")
+			return
+		}
+	}
+
 	var locations []location
 	if _, err := os.Stat("locations.json"); os.IsNotExist(err) {
 		fmt.Println("本地 locations.json 不存在\n正在从 https://locations-adw.pages.dev/ 下载 locations.json")
@@ -106,7 +331,7 @@ func main() {
 
 		defer resp.Body.Close()
 
-		body, err := io.ReadAll(resp.Body) // 修复：使用 io.ReadAll 替代 ioutil.ReadAll
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			fmt.Printf("无法读取响应体: %v\n", err)
 			return
@@ -138,7 +363,7 @@ func main() {
 		}
 		defer file.Close()
 
-		body, err := io.ReadAll(file) // 修复：使用 io.ReadAll 替代 ioutil.ReadAll
+		body, err := io.ReadAll(file)
 		if err != nil {
 			fmt.Printf("无法读取文件: %v\n", err)
 			return
@@ -156,22 +381,32 @@ func main() {
 		locationMap[loc.Iata] = loc
 	}
 
-	// 解析机场码过滤
-	var regionFilter map[string]bool
+	var ips []string
+	var err error
+
+	// 如果指定了机场码，直接从Cloudflare获取对应IP范围
 	if *region != "" {
-		regionFilter = make(map[string]bool)
-		regions := strings.Split(*region, ",")
-		for _, r := range regions {
-			regionFilter[strings.TrimSpace(strings.ToUpper(r))] = true
+		fmt.Printf("正在根据机场码 %v 获取Cloudflare IP范围...\n", selectedCodes)
+		ips, err = getIPRangesByAirportCodes(selectedCodes)
+		if err != nil {
+			fmt.Printf("获取Cloudflare IP范围失败: %v\n", err)
+			fmt.Println("回退到使用文件中的IP列表")
+			ips, err = readIPs(*File)
+			if err != nil {
+				fmt.Printf("无法从文件中读取 IP: %v\n", err)
+				return
+			}
 		}
-		fmt.Printf("启用机场码过滤: %v\n", regions)
+	} else {
+		// 使用文件中的IP列表
+		ips, err = readIPs(*File)
+		if err != nil {
+			fmt.Printf("无法从文件中读取 IP: %v\n", err)
+			return
+		}
 	}
 
-	ips, err := readIPs(*File)
-	if err != nil {
-		fmt.Printf("无法从文件中读取 IP: %v\n", err)
-		return
-	}
+	fmt.Printf("总共需要测试 %d 个IP范围\n", len(ips))
 
 	var wg sync.WaitGroup
 	wg.Add(len(ips))
