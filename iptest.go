@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -21,8 +22,8 @@ import (
 )
 
 const (
-	timeout     = 1 * time.Second
-	maxDuration = 2 * time.Second
+	timeout     = 2 * time.Second
+	maxDuration = 5 * time.Second
 )
 
 var (
@@ -50,19 +51,14 @@ type IPInfo struct {
 }
 
 type Result struct {
-	IP          string
-	Port        int
-	Country     string
-	Region      string
-	City        string
-	ISP         string
-	Latency     string
-	TCPDuration time.Duration
-	DownloadSpeed float64
-}
-
-type SpeedTestResult struct {
-	Result
+	IP            string
+	Port          int
+	Country       string
+	Region        string
+	City          string
+	ISP           string
+	Latency       string
+	TCPDuration   time.Duration
 	DownloadSpeed float64
 }
 
@@ -82,9 +78,9 @@ func getIPInfo(ip string) (*IPInfo, error) {
 		if err != nil {
 			continue
 		}
-		defer resp.Body.Close()
-
+		
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			continue
 		}
@@ -102,13 +98,6 @@ func getIPInfo(ip string) (*IPInfo, error) {
 	}
 
 	return nil, fmt.Errorf("无法获取IP %s 的地理位置信息", ip)
-}
-
-// 本地IP地理位置数据库（用于快速查询常见IP段）
-func getLocalIPInfo(ip string) *IPInfo {
-	// 这里可以添加本地IP数据库查询
-	// 例如：解析ip2location或qqwry.dat等
-	return nil
 }
 
 func increaseMaxOpenFiles() {
@@ -157,6 +146,7 @@ func readIPs(filename string) ([]string, error) {
 	return ips, nil
 }
 
+// 修复1: 延迟测试 - 直接使用IP避免DNS解析，并包含TLS握手
 func testTCPConnection(ip string, port int) (time.Duration, error) {
 	dialer := &net.Dialer{
 		Timeout:   timeout,
@@ -170,9 +160,60 @@ func testTCPConnection(ip string, port int) (time.Duration, error) {
 	}
 	defer conn.Close()
 	
+	// 如果启用TLS，测量TLS握手时间
+	if *enableTLS {
+		tlsConn := tls.Client(conn, &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         "cloudflare.com",
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			return 0, err
+		}
+		return time.Since(start), nil
+	}
+	
 	return time.Since(start), nil
 }
 
+// 修复2: HTTP完整请求延迟测试（可选）
+func testHTTPLatency(ip string, port int) (time.Duration, error) {
+	protocol := "http://"
+	if *enableTLS {
+		protocol = "https://"
+	}
+	
+	// 使用HEAD请求测试延迟
+	url := fmt.Sprintf("%s%s:%d/", protocol, ip, port)
+	req, err := http.NewRequest("HEAD", url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   timeout,
+				KeepAlive: 0,
+			}).DialContext,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+	
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	
+	return time.Since(start), nil
+}
+
+// 修复3: 速度测试优化
 func testSpeed(ip string, port int) float64 {
 	if *speedTest <= 0 {
 		return 0
@@ -183,32 +224,26 @@ func testSpeed(ip string, port int) float64 {
 		protocol = "https://"
 	}
 	
+	// 构建完整的URL
 	url := protocol + *speedTestURL
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return 0
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
-	req.Close = true
-
-	dialer := &net.Dialer{
-		Timeout:   timeout,
-		KeepAlive: 0,
-	}
+	req.Header.Set("Connection", "close")
 	
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
-	if err != nil {
-		return 0
-	}
-	defer conn.Close()
-
 	client := &http.Client{
 		Transport: &http.Transport{
-			Dial: func(network, addr string) (net.Conn, error) {
-				return conn, nil
+			DialContext: (&net.Dialer{
+				Timeout:   timeout,
+				KeepAlive: 0,
+			}).DialContext,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
 			},
 		},
-		Timeout: 5 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 
 	startTime := time.Now()
@@ -228,10 +263,12 @@ func testSpeed(ip string, port int) float64 {
 		return 0
 	}
 	
-	speed := float64(written) / duration.Seconds() / 1024 // KB/s
+	// 计算速度 (KB/s)
+	speed := float64(written) / duration.Seconds() / 1024
 	return speed
 }
 
+// 修复4: 主要处理逻辑优化
 func processIP(ipLine string, results chan<- Result, wg *sync.WaitGroup, sem chan struct{}) {
 	defer wg.Done()
 	defer func() {
@@ -254,18 +291,34 @@ func processIP(ipLine string, results chan<- Result, wg *sync.WaitGroup, sem cha
 		return
 	}
 
-	// TCP连接测试
+	// 1. 测量TCP连接延迟（包含TLS握手）
 	tcpDuration, err := testTCPConnection(ipAddr, port)
 	if err != nil {
 		return
 	}
 	
+	// 2. 测量HTTP完整请求延迟（可选，用于更准确的延迟）
+	var httpDuration time.Duration
+	var effectiveLatency time.Duration
+	
+	// 如果启用了延迟过滤或速度测试，进行HTTP延迟测试
+	if *delay > 0 || *speedTest > 0 {
+		httpDuration, _ = testHTTPLatency(ipAddr, port)
+	}
+	
+	// 选择延迟值：优先使用HTTP延迟（更准确），否则使用TCP延迟
+	if httpDuration > 0 && httpDuration < maxDuration {
+		effectiveLatency = httpDuration
+	} else {
+		effectiveLatency = tcpDuration
+	}
+	
 	// 延迟过滤
-	if *delay > 0 && tcpDuration.Milliseconds() > int64(*delay) {
+	if *delay > 0 && effectiveLatency.Milliseconds() > int64(*delay) {
 		return
 	}
 
-	// 获取地理位置信息
+	// 3. 获取地理位置信息
 	ipInfo, err := getIPInfo(ipAddr)
 	if err != nil {
 		// 如果无法获取地理位置，仍然记录IP和延迟
@@ -276,13 +329,13 @@ func processIP(ipLine string, results chan<- Result, wg *sync.WaitGroup, sem cha
 			Region:      "未知",
 			City:        "未知",
 			ISP:         "未知",
-			Latency:     fmt.Sprintf("%d ms", tcpDuration.Milliseconds()),
-			TCPDuration: tcpDuration,
+			Latency:     fmt.Sprintf("%d ms", effectiveLatency.Milliseconds()),
+			TCPDuration: effectiveLatency,
 		}
 		return
 	}
 
-	// 速度测试（如果启用）
+	// 4. 速度测试（如果启用）
 	var downloadSpeed float64
 	if *speedTest > 0 {
 		downloadSpeed = testSpeed(ipAddr, port)
@@ -295,15 +348,23 @@ func processIP(ipLine string, results chan<- Result, wg *sync.WaitGroup, sem cha
 		Region:        ipInfo.Region,
 		City:          ipInfo.City,
 		ISP:           ipInfo.ISP,
-		Latency:       fmt.Sprintf("%d ms", tcpDuration.Milliseconds()),
-		TCPDuration:   tcpDuration,
+		Latency:       fmt.Sprintf("%d ms", effectiveLatency.Milliseconds()),
+		TCPDuration:   effectiveLatency,
 		DownloadSpeed: downloadSpeed,
 	}
 	
 	results <- result
-	fmt.Printf("✓ 有效IP: %s:%d | 位置: %s %s %s | 延迟: %dms | 速度: %.0f KB/s\n",
-		ipAddr, port, ipInfo.Country, ipInfo.Region, ipInfo.City,
-		tcpDuration.Milliseconds(), downloadSpeed)
+	
+	// 输出结果
+	if downloadSpeed > 0 {
+		fmt.Printf("✓ 有效IP: %s:%d | 位置: %s %s %s | 延迟: %dms | 速度: %.0f KB/s\n",
+			ipAddr, port, ipInfo.Country, ipInfo.Region, ipInfo.City,
+			effectiveLatency.Milliseconds(), downloadSpeed)
+	} else {
+		fmt.Printf("✓ 有效IP: %s:%d | 位置: %s %s %s | 延迟: %dms\n",
+			ipAddr, port, ipInfo.Country, ipInfo.Region, ipInfo.City,
+			effectiveLatency.Milliseconds())
+	}
 }
 
 func main() {
@@ -325,6 +386,8 @@ func main() {
 	}
 	
 	fmt.Printf("共加载 %d 个IP地址，开始测试...\n", len(ips))
+	fmt.Printf("配置: 并发数=%d, 测速线程=%d, TLS=%v, 延迟阈值=%dms\n", 
+		*maxThreads, *speedTest, *enableTLS, *delay)
 
 	var wg sync.WaitGroup
 	results := make(chan Result, len(ips))
@@ -340,7 +403,7 @@ func main() {
 		
 		// 显示进度
 		atomic.AddInt32(&processed, 1)
-		if atomic.LoadInt32(&processed)%10 == 0 {
+		if atomic.LoadInt32(&processed)%10 == 0 || atomic.LoadInt32(&processed) == int32(total) {
 			fmt.Printf("进度: %d/%d (%.1f%%)\n", 
 				atomic.LoadInt32(&processed), total, 
 				float64(atomic.LoadInt32(&processed))/float64(total)*100)
@@ -355,10 +418,13 @@ func main() {
 
 	// 收集结果
 	var allResults []Result
-	var validCount int32
+	var validCount int
+	var totalLatency time.Duration
+	
 	for result := range results {
 		allResults = append(allResults, result)
-		atomic.AddInt32(&validCount, 1)
+		validCount++
+		totalLatency += result.TCPDuration
 	}
 
 	if len(allResults) == 0 {
@@ -366,12 +432,17 @@ func main() {
 		return
 	}
 
+	// 计算平均延迟
+	avgLatency := totalLatency / time.Duration(validCount)
+
 	// 排序结果
 	if *speedTest > 0 {
+		// 按速度降序排序
 		sort.Slice(allResults, func(i, j int) bool {
 			return allResults[i].DownloadSpeed > allResults[j].DownloadSpeed
 		})
 	} else {
+		// 按延迟升序排序
 		sort.Slice(allResults, func(i, j int) bool {
 			return allResults[i].TCPDuration < allResults[j].TCPDuration
 		})
@@ -383,8 +454,16 @@ func main() {
 		return
 	}
 
+	// 输出统计信息
 	fmt.Printf("\n✅ 测试完成!\n")
-	fmt.Printf("有效IP数量: %d\n", validCount)
+	fmt.Printf("有效IP数量: %d/%d\n", validCount, total)
+	fmt.Printf("平均延迟: %d ms\n", avgLatency.Milliseconds())
+	fmt.Printf("最快延迟: %d ms\n", allResults[0].TCPDuration.Milliseconds())
+	if *speedTest > 0 {
+		fmt.Printf("最快速度: %.0f KB/s (%.2f MB/s)\n", 
+			allResults[0].DownloadSpeed, 
+			allResults[0].DownloadSpeed/1024)
+	}
 	fmt.Printf("结果已保存到: %s\n", *outFile)
 	fmt.Printf("总耗时: %.2f 秒\n", time.Since(startTime).Seconds())
 }
@@ -405,9 +484,9 @@ func writeCSV(results []Result, filename string) error {
 	defer writer.Flush()
 
 	// 写入表头
-	header := []string{"IP地址", "端口", "TLS", "国家", "地区", "城市", "ISP", "网络延迟"}
+	header := []string{"IP地址", "端口", "TLS", "国家", "地区", "城市", "ISP", "网络延迟(ms)"}
 	if *speedTest > 0 {
-		header = append(header, "下载速度(KB/s)")
+		header = append(header, "下载速度(KB/s)", "下载速度(MB/s)")
 	}
 	if err := writer.Write(header); err != nil {
 		return err
@@ -426,7 +505,9 @@ func writeCSV(results []Result, filename string) error {
 			r.Latency,
 		}
 		if *speedTest > 0 {
+			speedMB := r.DownloadSpeed / 1024
 			row = append(row, fmt.Sprintf("%.0f", r.DownloadSpeed))
+			row = append(row, fmt.Sprintf("%.2f", speedMB))
 		}
 		if err := writer.Write(row); err != nil {
 			return err
@@ -434,10 +515,4 @@ func writeCSV(results []Result, filename string) error {
 	}
 
 	return nil
-}
-
-// 可选：添加本地IP数据库支持
-func initLocalIPDB() {
-	// 这里可以加载本地IP数据库
-	// 例如：下载并解析 https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt
 }
