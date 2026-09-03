@@ -112,20 +112,27 @@ jobs:
           go-version: "1.21"
           cache: true
 
+      # 重要：下载依赖
+      - name: Download dependencies
+        run: |
+          go mod download
+          go mod verify
+
       # 下载 GeoIP 数据库
       - name: Download GeoLite2 Database
         run: |
           echo "正在下载 GeoLite2-City.mmdb..."
-          # 使用国内镜像源加速下载
+          # 尝试多个源
           wget -O GeoLite2-City.mmdb https://git.io/GeoLite2-City.mmdb || \
           wget -O GeoLite2-City.mmdb https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb || \
           wget -O GeoLite2-City.mmdb https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb
           
-          # 验证文件
           if [ -f "GeoLite2-City.mmdb" ]; then
             echo "GeoIP数据库下载成功，文件大小: $(ls -lh GeoLite2-City.mmdb | awk '{print $5}')"
           else
             echo "警告: GeoIP数据库下载失败，将只使用Cloudflare数据中心信息"
+            # 创建一个空文件避免构建失败
+            touch GeoLite2-City.mmdb
           fi
 
       - name: Create Release Assets Directory
@@ -142,25 +149,17 @@ jobs:
           echo "Building iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}..."
           
           # 设置编译标志
+          export CGO_ENABLED=0
+          
           if [ "${{ matrix.goos }}" = "linux" ] && [[ "${{ matrix.goarch }}" == "arm"* ]]; then
-            # 对于 Linux ARM 架构，使用完全静态编译
-            export CGO_ENABLED=0
-            export GOARM=7  # 对于 ARMv7 兼容性
+            export GOARM=7
             go build -a -ldflags="-s -w -extldflags=-static" -o ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} iptest.go
-          elif [ "${{ matrix.goos }}" = "linux" ]; then
-            # 对于其他 Linux 架构，禁用 CGO
-            export CGO_ENABLED=0
-            go build -ldflags="-s -w" -o ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} iptest.go
           else
-            # 对于非 Linux 系统，正常编译
-            export CGO_ENABLED=0
             go build -ldflags="-s -w" -o ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} iptest.go
           fi
           
-          # 验证文件
           if [ -f "${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}" ]; then
             echo "构建成功"
-            file ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}
           else
             echo "构建失败"
             exit 1
@@ -169,17 +168,14 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           GOOS: ${{ matrix.goos }}
 
-      # 复制资源文件到发布目录
       - name: Copy resource files
         run: |
-          # 复制 locations.json
           if [ -f "locations.json" ]; then
             cp locations.json ${{ github.workspace }}/release_assets/
             echo "已复制 locations.json"
           fi
           
-          # 复制 GeoLite2 数据库
-          if [ -f "GeoLite2-City.mmdb" ]; then
+          if [ -f "GeoLite2-City.mmdb" ] && [ -s "GeoLite2-City.mmdb" ]; then
             cp GeoLite2-City.mmdb ${{ github.workspace }}/release_assets/
             echo "已复制 GeoLite2-City.mmdb"
           fi
@@ -225,25 +221,25 @@ jobs:
             ## 多平台构建版本
             **构建时间:** ${{ needs.build.outputs.build_time }}
 
-            **新功能:**
+            ## 新功能
             - ✅ 集成 GeoIP2 离线数据库，支持精确的 IP 地理位置定位
             - ✅ 支持中国境内城市准确识别
             - ✅ 内置 GeoLite2-City.mmdb 数据库文件
             - ✅ 自动检测并使用 GeoIP 数据库（如存在）
             - ✅ 保留 Cloudflare 数据中心信息作为备选
 
-            **使用方法:**
+            ## 使用方法
             1. 将 GeoLite2-City.mmdb 和 locations.json 放在程序同目录
             2. 运行程序即可自动识别 IP 地理位置
             3. 可通过 `-disable-geoip` 参数禁用 GeoIP
 
-            **参数说明:**
+            ## 参数说明
             - `-geodb` : 指定 GeoIP 数据库路径（默认: GeoLite2-City.mmdb）
             - `-disable-geoip` : 禁用 GeoIP 数据库
 
-            **重要提示:** 
-            - Linux ARM/ARM64 版本为完全静态编译，适用于 OpenWrt 等嵌入式系统
+            ## 注意事项
             - GeoLite2 数据库为免费版，数据可能存在一定偏差
+            - 所有版本均静态编译，无需额外依赖
 
             完整变更日志:  
             https://github.com/Kwisma/iptest/commits/${{ github.event.inputs.release_tag || github.ref_name }}
