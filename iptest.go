@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"crypto/tls"
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -19,500 +20,626 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/oschwald/geoip2-golang"
 )
 
 const (
-	timeout     = 2 * time.Second
-	maxDuration = 5 * time.Second
+	requestURL  = "speed.cloudflare.com/cdn-cgi/trace" // 请求trace URL
+	timeout     = 1 * time.Second                      // 超时时间
+	maxDuration = 2 * time.Second                      // 最大持续时间
 )
 
 var (
-	File         = flag.String("file", "ip.txt", "IP地址文件名称,格式为 ip port")
-	outFile      = flag.String("outfile", "ip.csv", "输出文件名称")
-	maxThreads   = flag.Int("max", 100, "并发请求最大协程数")
-	speedTest    = flag.Int("speedtest", 5, "下载测速协程数量,设为0禁用测速")
-	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=50000000", "测速文件地址")
-	enableTLS    = flag.Bool("tls", true, "是否启用TLS")
-	delay        = flag.Int("delay", 0, "延迟阈值(ms)，默认为0禁用延迟过滤")
+	File          = flag.String("file", "ip.txt", "IP地址文件名称,格式为 ip port ,就是IP和端口之间用空格隔开")
+	outFile       = flag.String("outfile", "ip.csv", "输出文件名称")
+	maxThreads    = flag.Int("max", 100, "并发请求最大协程数")
+	speedTest     = flag.Int("speedtest", 5, "下载测速协程数量,设为0禁用测速")
+	speedTestURL  = flag.String("url", "speed.cloudflare.com/__down?bytes=50000000", "测速文件地址")
+	enableTLS     = flag.Bool("tls", true, "是否启用TLS")
+	delay         = flag.Int("delay", 0, "延迟阈值(ms)，默认为0禁用延迟过滤")
+	geoDBPath     = flag.String("geodb", "GeoLite2-City.mmdb", "GeoIP数据库文件路径")
+	disableGeoIP  = flag.Bool("disable-geoip", false, "禁用GeoIP数据库")
 )
 
-type IPInfo struct {
-	IP          string  `json:"ip"`
-	Country     string  `json:"country"`
-	CountryCode string  `json:"country_code"`
-	Region      string  `json:"region"`
-	RegionCode  string  `json:"region_code"`
-	City        string  `json:"city"`
-	Latitude    float64 `json:"latitude"`
-	Longitude   float64 `json:"longitude"`
-	ISP         string  `json:"isp"`
-	Organization string `json:"org"`
-	Timezone    string  `json:"timezone"`
+type result struct {
+	ip          string        // IP地址
+	port        int           // 端口
+	dataCenter  string        // 数据中心
+	locCode     string        // 源IP位置
+	region      string        // 地区
+	city        string        // 城市
+	region_zh   string        // 地区中文
+	country     string        // 国家
+	city_zh     string        // 城市中文
+	emoji       string        // 国旗
+	latency     string        // 延迟
+	tcpDuration time.Duration // TCP请求延迟
 }
 
-type Result struct {
-	IP            string
-	Port          int
-	Country       string
-	Region        string
-	City          string
-	ISP           string
-	Latency       string
-	TCPDuration   time.Duration
-	DownloadSpeed float64
+type speedtestresult struct {
+	result
+	downloadSpeed float64 // 下载速度
 }
 
-// IP地理位置查询（使用多个备用API）
-func getIPInfo(ip string) (*IPInfo, error) {
-	// 尝试多个API以提高准确性
-	apis := []string{
-		// 主要使用ip-api.com，对中国IP较准确
-		fmt.Sprintf("http://ip-api.com/json/%s?fields=status,message,country,countryCode,region,regionName,city,lat,lon,isp,org,timezone", ip),
-		// 备用API
-		fmt.Sprintf("https://ipinfo.io/%s/json", ip),
+type location struct {
+	Iata      string  `json:"iata"`
+	Lat       float64 `json:"lat"`
+	Lon       float64 `json:"lon"`
+	Cca2      string  `json:"cca2"`
+	Region    string  `json:"region"`
+	City      string  `json:"city"`
+	Region_zh string  `json:"region_zh"`
+	Country   string  `json:"country"`
+	City_zh   string  `json:"city_zh"`
+	Emoji     string  `json:"emoji"`
+}
+
+var (
+	geoReader *geoip2.Reader
+	mu        sync.Mutex
+)
+
+// 初始化GeoIP数据库
+func initGeoIP(dbPath string) error {
+	if *disableGeoIP {
+		fmt.Println("GeoIP已禁用")
+		return nil
 	}
 
-	for _, apiURL := range apis {
-		client := &http.Client{Timeout: 3 * time.Second}
-		resp, err := client.Get(apiURL)
-		if err != nil {
-			continue
-		}
-		
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return fmt.Errorf("GeoIP数据库文件不存在: %s", dbPath)
+	}
 
-		var info IPInfo
-		if err := json.Unmarshal(body, &info); err != nil {
-			continue
-		}
+	var err error
+	geoReader, err = geoip2.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("无法打开GeoIP数据库: %v", err)
+	}
+	fmt.Println("GeoIP数据库加载成功")
+	return nil
+}
 
-		// 检查是否成功获取信息
-		if info.Country != "" || info.City != "" {
-			info.IP = ip
-			return &info, nil
+// 从GeoIP数据库获取IP地理位置
+func getIPLocationFromDB(ipStr string) (country, region, city, countryCode string, err error) {
+	if geoReader == nil {
+		return "", "", "", "", fmt.Errorf("GeoIP数据库未初始化")
+	}
+
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return "", "", "", "", fmt.Errorf("无效IP地址")
+	}
+
+	record, err := geoReader.City(ip)
+	if err != nil {
+		return "", "", "", "", err
+	}
+
+	// 获取中文名称，如果没有则使用英文
+	city = record.City.Names["zh-CN"]
+	if city == "" {
+		city = record.City.Names["en"]
+	}
+
+	if len(record.Subdivisions) > 0 {
+		region = record.Subdivisions[0].Names["zh-CN"]
+		if region == "" {
+			region = record.Subdivisions[0].Names["en"]
 		}
 	}
 
-	return nil, fmt.Errorf("无法获取IP %s 的地理位置信息", ip)
+	country = record.Country.Names["zh-CN"]
+	if country == "" {
+		country = record.Country.Names["en"]
+	}
+
+	countryCode = record.Country.IsoCode
+
+	return country, region, city, countryCode, nil
 }
 
+// 尝试提升文件描述符的上限
 func increaseMaxOpenFiles() {
-	if runtime.GOOS == "linux" {
-		fmt.Println("正在优化系统资源限制...")
-		cmd := exec.Command("bash", "-c", "ulimit -n 10000")
-		if err := cmd.Run(); err != nil {
-			fmt.Printf("优化资源限制失败: %v\n", err)
-		}
-	}
-}
-
-func readIPs(filename string) ([]string, error) {
-	file, err := os.Open(filename)
+	fmt.Println("正在尝试提升文件描述符的上限...")
+	cmd := exec.Command("bash", "-c", "ulimit -n 10000")
+	_, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var ips []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			fmt.Printf("跳过格式错误行: %s\n", line)
-			continue
-		}
-		
-		port, err := strconv.Atoi(parts[1])
-		if err != nil {
-			fmt.Printf("跳过无效端口: %s\n", parts[1])
-			continue
-		}
-		
-		ips = append(ips, fmt.Sprintf("%s %d", parts[0], port))
-	}
-	
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	
-	return ips, nil
-}
-
-// 修复1: 延迟测试 - 直接使用IP避免DNS解析，并包含TLS握手
-func testTCPConnection(ip string, port int) (time.Duration, error) {
-	dialer := &net.Dialer{
-		Timeout:   timeout,
-		KeepAlive: 0,
-	}
-	
-	start := time.Now()
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Close()
-	
-	// 如果启用TLS，测量TLS握手时间
-	if *enableTLS {
-		tlsConn := tls.Client(conn, &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         "cloudflare.com",
-		})
-		if err := tlsConn.Handshake(); err != nil {
-			return 0, err
-		}
-		return time.Since(start), nil
-	}
-	
-	return time.Since(start), nil
-}
-
-// 修复2: HTTP完整请求延迟测试（可选）
-func testHTTPLatency(ip string, port int) (time.Duration, error) {
-	protocol := "http://"
-	if *enableTLS {
-		protocol = "https://"
-	}
-	
-	// 使用HEAD请求测试延迟
-	url := fmt.Sprintf("%s%s:%d/", protocol, ip, port)
-	req, err := http.NewRequest("HEAD", url, nil)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   timeout,
-				KeepAlive: 0,
-			}).DialContext,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		},
-	}
-	
-	start := time.Now()
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	
-	return time.Since(start), nil
-}
-
-// 修复3: 速度测试优化
-func testSpeed(ip string, port int) float64 {
-	if *speedTest <= 0 {
-		return 0
-	}
-	
-	protocol := "http://"
-	if *enableTLS {
-		protocol = "https://"
-	}
-	
-	// 构建完整的URL
-	url := protocol + *speedTestURL
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return 0
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	req.Header.Set("Connection", "close")
-	
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   timeout,
-				KeepAlive: 0,
-			}).DialContext,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		},
-		Timeout: 10 * time.Second,
-	}
-
-	startTime := time.Now()
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-
-	written, err := io.Copy(io.Discard, resp.Body)
-	if err != nil {
-		return 0
-	}
-	
-	duration := time.Since(startTime)
-	if duration.Seconds() == 0 {
-		return 0
-	}
-	
-	// 计算速度 (KB/s)
-	speed := float64(written) / duration.Seconds() / 1024
-	return speed
-}
-
-// 修复4: 主要处理逻辑优化
-func processIP(ipLine string, results chan<- Result, wg *sync.WaitGroup, sem chan struct{}) {
-	defer wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("处理IP %s 时发生panic: %v\n", ipLine, r)
-		}
-	}()
-	
-	sem <- struct{}{}
-	defer func() { <-sem }()
-
-	parts := strings.Fields(ipLine)
-	if len(parts) != 2 {
-		return
-	}
-	
-	ipAddr := parts[0]
-	port, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return
-	}
-
-	// 1. 测量TCP连接延迟（包含TLS握手）
-	tcpDuration, err := testTCPConnection(ipAddr, port)
-	if err != nil {
-		return
-	}
-	
-	// 2. 测量HTTP完整请求延迟（可选，用于更准确的延迟）
-	var httpDuration time.Duration
-	var effectiveLatency time.Duration
-	
-	// 如果启用了延迟过滤或速度测试，进行HTTP延迟测试
-	if *delay > 0 || *speedTest > 0 {
-		httpDuration, _ = testHTTPLatency(ipAddr, port)
-	}
-	
-	// 选择延迟值：优先使用HTTP延迟（更准确），否则使用TCP延迟
-	if httpDuration > 0 && httpDuration < maxDuration {
-		effectiveLatency = httpDuration
+		fmt.Printf("提升文件描述符上限时出现错误: %v\n", err)
 	} else {
-		effectiveLatency = tcpDuration
-	}
-	
-	// 延迟过滤
-	if *delay > 0 && effectiveLatency.Milliseconds() > int64(*delay) {
-		return
-	}
-
-	// 3. 获取地理位置信息
-	ipInfo, err := getIPInfo(ipAddr)
-	if err != nil {
-		// 如果无法获取地理位置，仍然记录IP和延迟
-		results <- Result{
-			IP:          ipAddr,
-			Port:        port,
-			Country:     "未知",
-			Region:      "未知",
-			City:        "未知",
-			ISP:         "未知",
-			Latency:     fmt.Sprintf("%d ms", effectiveLatency.Milliseconds()),
-			TCPDuration: effectiveLatency,
-		}
-		return
-	}
-
-	// 4. 速度测试（如果启用）
-	var downloadSpeed float64
-	if *speedTest > 0 {
-		downloadSpeed = testSpeed(ipAddr, port)
-	}
-
-	result := Result{
-		IP:            ipAddr,
-		Port:          port,
-		Country:       ipInfo.Country,
-		Region:        ipInfo.Region,
-		City:          ipInfo.City,
-		ISP:           ipInfo.ISP,
-		Latency:       fmt.Sprintf("%d ms", effectiveLatency.Milliseconds()),
-		TCPDuration:   effectiveLatency,
-		DownloadSpeed: downloadSpeed,
-	}
-	
-	results <- result
-	
-	// 输出结果
-	if downloadSpeed > 0 {
-		fmt.Printf("✓ 有效IP: %s:%d | 位置: %s %s %s | 延迟: %dms | 速度: %.0f KB/s\n",
-			ipAddr, port, ipInfo.Country, ipInfo.Region, ipInfo.City,
-			effectiveLatency.Milliseconds(), downloadSpeed)
-	} else {
-		fmt.Printf("✓ 有效IP: %s:%d | 位置: %s %s %s | 延迟: %dms\n",
-			ipAddr, port, ipInfo.Country, ipInfo.Region, ipInfo.City,
-			effectiveLatency.Milliseconds())
+		fmt.Printf("文件描述符上限已提升!\n")
 	}
 }
 
 func main() {
 	flag.Parse()
-	
+	var validCount int32 // 有效IP计数器
+
 	startTime := time.Now()
-	increaseMaxOpenFiles()
-
-	// 读取IP列表
-	ips, err := readIPs(*File)
-	if err != nil {
-		fmt.Printf("读取IP文件失败: %v\n", err)
-		return
+	osType := runtime.GOOS
+	if osType == "linux" {
+		increaseMaxOpenFiles()
 	}
-	
-	if len(ips) == 0 {
-		fmt.Println("没有找到有效的IP地址")
-		return
+
+	// 初始化GeoIP数据库
+	if err := initGeoIP(*geoDBPath); err != nil {
+		fmt.Printf("警告: %v，将使用Cloudflare数据中心信息\n", err)
+	} else if geoReader != nil {
+		defer geoReader.Close()
 	}
-	
-	fmt.Printf("共加载 %d 个IP地址，开始测试...\n", len(ips))
-	fmt.Printf("配置: 并发数=%d, 测速线程=%d, TLS=%v, 延迟阈值=%dms\n", 
-		*maxThreads, *speedTest, *enableTLS, *delay)
 
-	var wg sync.WaitGroup
-	results := make(chan Result, len(ips))
-	sem := make(chan struct{}, *maxThreads)
-	
-	var processed int32
-	total := len(ips)
+	var locations []location
+	if _, err := os.Stat("locations.json"); os.IsNotExist(err) {
+		fmt.Println("本地 locations.json 不存在\n正在从 https://locations-adw.pages.dev/ 下载 locations.json")
+		resp, err := http.Get("https://locations-adw.pages.dev/")
+		if err != nil {
+			fmt.Printf("无法从URL中获取JSON: %v\n", err)
+			return
+		}
 
-	// 启动工作协程
-	for _, ip := range ips {
-		wg.Add(1)
-		go processIP(ip, results, &wg, sem)
-		
-		// 显示进度
-		atomic.AddInt32(&processed, 1)
-		if atomic.LoadInt32(&processed)%10 == 0 || atomic.LoadInt32(&processed) == int32(total) {
-			fmt.Printf("进度: %d/%d (%.1f%%)\n", 
-				atomic.LoadInt32(&processed), total, 
-				float64(atomic.LoadInt32(&processed))/float64(total)*100)
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			fmt.Printf("无法读取响应体: %v\n", err)
+			return
+		}
+
+		err = json.Unmarshal(body, &locations)
+		if err != nil {
+			fmt.Printf("无法解析JSON: %v\n", err)
+			return
+		}
+		file, err := os.Create("locations.json")
+		if err != nil {
+			fmt.Printf("无法创建文件: %v\n", err)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(body)
+		if err != nil {
+			fmt.Printf("无法写入文件: %v\n", err)
+			return
+		}
+	} else {
+		fmt.Println("本地 locations.json 已存在,无需重新下载")
+		file, err := os.Open("locations.json")
+		if err != nil {
+			fmt.Printf("无法打开文件: %v\n", err)
+			return
+		}
+		defer file.Close()
+
+		body, err := io.ReadAll(file)
+		if err != nil {
+			fmt.Printf("无法读取文件: %v\n", err)
+			return
+		}
+
+		err = json.Unmarshal(body, &locations)
+		if err != nil {
+			fmt.Printf("无法解析JSON: %v\n", err)
+			return
 		}
 	}
 
-	// 等待所有协程完成
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// 收集结果
-	var allResults []Result
-	var validCount int
-	var totalLatency time.Duration
-	
-	for result := range results {
-		allResults = append(allResults, result)
-		validCount++
-		totalLatency += result.TCPDuration
+	locationMap := make(map[string]location)
+	for _, loc := range locations {
+		locationMap[loc.Iata] = loc
 	}
 
-	if len(allResults) == 0 {
-		fmt.Println("没有发现有效的IP地址")
+	ips, err := readIPs(*File)
+	if err != nil {
+		fmt.Printf("无法从文件中读取 IP: %v\n", err)
 		return
 	}
 
-	// 计算平均延迟
-	avgLatency := totalLatency / time.Duration(validCount)
+	var wg sync.WaitGroup
+	wg.Add(len(ips))
 
-	// 排序结果
+	resultChan := make(chan result, len(ips))
+
+	thread := make(chan struct{}, *maxThreads)
+
+	var count int
+	total := len(ips)
+
+	for _, ip := range ips {
+		thread <- struct{}{}
+		go func(ip string) {
+			defer func() {
+				<-thread
+				wg.Done()
+				count++
+				percentage := float64(count) / float64(total) * 100
+				fmt.Printf("已完成: %d 总数: %d 已完成: %.2f%%\r", count, total, percentage)
+				if count == total {
+					fmt.Printf("已完成: %d 总数: %d 已完成: %.2f%%\n", count, total, percentage)
+				}
+			}()
+
+			parts := strings.Fields(ip)
+			if len(parts) != 2 {
+				fmt.Printf("IP地址格式错误: %s\n", ip)
+				return
+			}
+			ipAddr := parts[0]
+			portStr := parts[1]
+
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				fmt.Printf("端口格式错误: %s\n", portStr)
+				return
+			}
+
+			dialer := &net.Dialer{
+				Timeout:   timeout,
+				KeepAlive: 0,
+			}
+			start := time.Now()
+			conn, err := dialer.Dial("tcp", net.JoinHostPort(ipAddr, strconv.Itoa(port)))
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			tcpDuration := time.Since(start)
+			if *delay > 0 && tcpDuration.Milliseconds() > int64(*delay) {
+				return // 超过延迟阈值直接返回（仅在delay>0时生效）
+			}
+
+			start = time.Now()
+
+			client := http.Client{
+				Transport: &http.Transport{
+					Dial: func(network, addr string) (net.Conn, error) {
+						return conn, nil
+					},
+				},
+				Timeout: timeout,
+			}
+
+			var protocol string
+			if *enableTLS {
+				protocol = "https://"
+			} else {
+				protocol = "http://"
+			}
+			requestURL := protocol + requestURL
+
+			req, _ := http.NewRequest("GET", requestURL, nil)
+
+			// 添加用户代理
+			req.Header.Set("User-Agent", "Mozilla/5.0")
+			req.Close = true
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+
+			duration := time.Since(start)
+			if duration > maxDuration {
+				return
+			}
+
+			defer resp.Body.Close()
+			buf := &bytes.Buffer{}
+			// 创建一个读取操作的超时
+			timeout := time.After(maxDuration)
+			// 使用一个 goroutine 来读取响应体
+			done := make(chan bool)
+			errChan := make(chan error)
+			go func() {
+				_, err := io.Copy(buf, resp.Body)
+				done <- true
+				errChan <- err
+				if err != nil {
+					return
+				}
+			}()
+			// 等待读取操作完成或者超时
+			select {
+			case <-done:
+				// 读取操作完成
+			case <-timeout:
+				// 读取操作超时
+				return
+			}
+
+			body := buf
+			err = <-errChan
+			if err != nil {
+				return
+			}
+			if strings.Contains(body.String(), "uag=Mozilla/5.0") {
+				if matches := regexp.MustCompile(`colo=([A-Z]+)[\s\S]*?loc=([A-Z]+)`).FindStringSubmatch(body.String()); len(matches) > 2 {
+					dataCenter := matches[1]
+					locCode := matches[2]
+					
+					// 记录通过延迟检查的有效IP
+					atomic.AddInt32(&validCount, 1)
+
+					// 先尝试从GeoIP数据库获取位置信息
+					country, region, city, countryCode, err := getIPLocationFromDB(ipAddr)
+					
+					if err == nil && country != "" && !*disableGeoIP {
+						// 使用GeoIP数据
+						emoji := ""
+						// 根据countryCode查找对应的emoji
+						for _, loc := range locations {
+							if loc.Cca2 == countryCode {
+								emoji = loc.Emoji
+								break
+							}
+						}
+						// 如果找不到emoji，尝试从locationMap查找
+						if emoji == "" {
+							if loc, ok := locationMap[dataCenter]; ok {
+								emoji = loc.Emoji
+							}
+						}
+
+						fmt.Printf("发现有效IP %s 端口 %d 位置 %s %s (GeoIP) 延迟 %d 毫秒\n", 
+							ipAddr, port, city, region, tcpDuration.Milliseconds())
+						
+						resultChan <- result{
+							ip:          ipAddr,
+							port:        port,
+							dataCenter:  dataCenter,
+							locCode:     countryCode,
+							region:      region,
+							city:        city,
+							region_zh:   region,
+							country:     country,
+							city_zh:     city,
+							emoji:       emoji,
+							latency:     fmt.Sprintf("%d ms", tcpDuration.Milliseconds()),
+							tcpDuration: tcpDuration,
+						}
+					} else {
+						// 使用原有的Cloudflare数据中心信息作为备选
+						loc, ok := locationMap[dataCenter]
+						if ok {
+							fmt.Printf("发现有效IP %s 端口 %d 位置信息 %s (Cloudflare) 延迟 %d 毫秒\n", 
+								ipAddr, port, loc.City_zh, tcpDuration.Milliseconds())
+							resultChan <- result{
+								ip:          ipAddr,
+								port:        port,
+								dataCenter:  dataCenter,
+								locCode:     locCode,
+								region:      loc.Region,
+								city:        loc.City,
+								region_zh:   loc.Region_zh,
+								country:     loc.Country,
+								city_zh:     loc.City_zh,
+								emoji:       loc.Emoji,
+								latency:     fmt.Sprintf("%d ms", tcpDuration.Milliseconds()),
+								tcpDuration: tcpDuration,
+							}
+						} else {
+							fmt.Printf("发现有效IP %s 端口 %d 位置信息未知 延迟 %d 毫秒\n", 
+								ipAddr, port, tcpDuration.Milliseconds())
+							resultChan <- result{
+								ip:          ipAddr,
+								port:        port,
+								dataCenter:  dataCenter,
+								locCode:     locCode,
+								region:      "",
+								city:        "",
+								region_zh:   "",
+								country:     "",
+								city_zh:     "",
+								emoji:       "",
+								latency:     fmt.Sprintf("%d ms", tcpDuration.Milliseconds()),
+								tcpDuration: tcpDuration,
+							}
+						}
+					}
+				}
+			}
+		}(ip)
+	}
+
+	wg.Wait()
+	close(resultChan)
+
+	if len(resultChan) == 0 {
+		// 清除输出内容
+		fmt.Print("\033[2J")
+		fmt.Println("没有发现有效的IP")
+		return
+	}
+	var results []speedtestresult
 	if *speedTest > 0 {
-		// 按速度降序排序
-		sort.Slice(allResults, func(i, j int) bool {
-			return allResults[i].DownloadSpeed > allResults[j].DownloadSpeed
+		fmt.Printf("找到符合条件的ip 共%d个\n", atomic.LoadInt32(&validCount))
+		fmt.Printf("开始测速\n")
+		var wg2 sync.WaitGroup
+		wg2.Add(*speedTest)
+		count = 0
+		total := len(resultChan)
+		results = []speedtestresult{}
+		for i := 0; i < *speedTest; i++ {
+			thread <- struct{}{}
+			go func() {
+				defer func() {
+					<-thread
+					wg2.Done()
+				}()
+				for res := range resultChan {
+					downloadSpeed := getDownloadSpeed(res.ip, res.port)
+					results = append(results, speedtestresult{result: res, downloadSpeed: downloadSpeed})
+
+					count++
+					percentage := float64(count) / float64(total) * 100
+					fmt.Printf("已完成: %.2f%%\r", percentage)
+					if count == total {
+						fmt.Printf("已完成: %.2f%%\n", percentage)
+					}
+				}
+			}()
+		}
+		wg2.Wait()
+	} else {
+		for res := range resultChan {
+			results = append(results, speedtestresult{result: res})
+		}
+	}
+
+	if *speedTest > 0 {
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].downloadSpeed > results[j].downloadSpeed
 		})
 	} else {
-		// 按延迟升序排序
-		sort.Slice(allResults, func(i, j int) bool {
-			return allResults[i].TCPDuration < allResults[j].TCPDuration
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].result.tcpDuration < results[j].result.tcpDuration
 		})
 	}
 
-	// 输出CSV文件
-	if err := writeCSV(allResults, *outFile); err != nil {
-		fmt.Printf("写入CSV文件失败: %v\n", err)
-		return
-	}
-
-	// 输出统计信息
-	fmt.Printf("\n✅ 测试完成!\n")
-	fmt.Printf("有效IP数量: %d/%d\n", validCount, total)
-	fmt.Printf("平均延迟: %d ms\n", avgLatency.Milliseconds())
-	fmt.Printf("最快延迟: %d ms\n", allResults[0].TCPDuration.Milliseconds())
-	if *speedTest > 0 {
-		fmt.Printf("最快速度: %.0f KB/s (%.2f MB/s)\n", 
-			allResults[0].DownloadSpeed, 
-			allResults[0].DownloadSpeed/1024)
-	}
-	fmt.Printf("结果已保存到: %s\n", *outFile)
-	fmt.Printf("总耗时: %.2f 秒\n", time.Since(startTime).Seconds())
-}
-
-func writeCSV(results []Result, filename string) error {
-	file, err := os.Create(filename)
+	file, err := os.Create(*outFile)
 	if err != nil {
-		return err
+		fmt.Printf("无法创建文件: %v\n", err)
+		return
 	}
 	defer file.Close()
 
-	// 写入UTF-8 BOM
-	if _, err := file.WriteString("\xEF\xBB\xBF"); err != nil {
-		return err
+	// 写入UTF-8 BOM防止中文乱码
+	_, err = file.WriteString("\xEF\xBB\xBF")
+	if err != nil {
+		fmt.Printf("写入BOM时出现错误: %v\n", err)
+		return
 	}
 
 	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	// 写入表头
-	header := []string{"IP地址", "端口", "TLS", "国家", "地区", "城市", "ISP", "网络延迟(ms)"}
 	if *speedTest > 0 {
-		header = append(header, "下载速度(KB/s)", "下载速度(MB/s)")
+		writer.Write([]string{"IP地址", "端口", "TLS", "数据中心", "源IP位置", "地区", "城市", "地区(中文)", "国家", "城市(中文)", "国旗", "网络延迟", "下载速度"})
+	} else {
+		writer.Write([]string{"IP地址", "端口", "TLS", "数据中心", "源IP位置", "地区", "城市", "地区(中文)", "国家", "城市(中文)", "国旗", "网络延迟"})
 	}
-	if err := writer.Write(header); err != nil {
-		return err
-	}
-
-	// 写入数据
-	for _, r := range results {
-		row := []string{
-			r.IP,
-			strconv.Itoa(r.Port),
-			strconv.FormatBool(*enableTLS),
-			r.Country,
-			r.Region,
-			r.City,
-			r.ISP,
-			r.Latency,
-		}
+	for _, res := range results {
 		if *speedTest > 0 {
-			speedMB := r.DownloadSpeed / 1024
-			row = append(row, fmt.Sprintf("%.0f", r.DownloadSpeed))
-			row = append(row, fmt.Sprintf("%.2f", speedMB))
-		}
-		if err := writer.Write(row); err != nil {
-			return err
+			writer.Write([]string{
+				res.result.ip, 
+				strconv.Itoa(res.result.port), 
+				strconv.FormatBool(*enableTLS), 
+				res.result.dataCenter, 
+				res.result.locCode, 
+				res.result.region, 
+				res.result.city, 
+				res.result.region_zh, 
+				res.result.country, 
+				res.result.city_zh, 
+				res.result.emoji, 
+				res.result.latency, 
+				fmt.Sprintf("%.0f kB/s", res.downloadSpeed),
+			})
+		} else {
+			writer.Write([]string{
+				res.result.ip, 
+				strconv.Itoa(res.result.port), 
+				strconv.FormatBool(*enableTLS), 
+				res.result.dataCenter, 
+				res.result.locCode, 
+				res.result.region, 
+				res.result.city, 
+				res.result.region_zh, 
+				res.result.country, 
+				res.result.city_zh, 
+				res.result.emoji, 
+				res.result.latency,
+			})
 		}
 	}
 
-	return nil
+	writer.Flush()
+	// 清除输出内容
+	fmt.Print("\033[2J")
+	fmt.Printf("有效IP数量: %d | 成功将结果写入文件 %s，耗时 %d秒\n", 
+		atomic.LoadInt32(&validCount), *outFile, time.Since(startTime)/time.Second)
+}
+
+// 从文件中读取IP地址和端口
+func readIPs(File string) ([]string, error) {
+	file, err := os.Open(File)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var ips []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			fmt.Printf("行格式错误: %s\n", line)
+			continue
+		}
+		ipAddr := parts[0]
+		portStr := parts[1]
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			fmt.Printf("端口格式错误: %s\n", portStr)
+			continue
+		}
+
+		ip := fmt.Sprintf("%s %d", ipAddr, port)
+		ips = append(ips, ip)
+	}
+	return ips, scanner.Err()
+}
+
+// 测速函数
+func getDownloadSpeed(ip string, port int) float64 {
+	var protocol string
+	if *enableTLS {
+		protocol = "https://"
+	} else {
+		protocol = "http://"
+	}
+	speedTestURL := protocol + *speedTestURL
+	// 创建请求
+	req, _ := http.NewRequest("GET", speedTestURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	// 创建TCP连接
+	dialer := &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 0,
+	}
+	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	if err != nil {
+		return 0
+	}
+	defer conn.Close()
+
+	fmt.Printf("正在测试IP %s 端口 %d\n", ip, port)
+	startTime := time.Now()
+	// 创建HTTP客户端
+	client := http.Client{
+		Transport: &http.Transport{
+			Dial: func(network, addr string) (net.Conn, error) {
+				return conn, nil
+			},
+		},
+		//设置单个IP测速最长时间为5秒
+		Timeout: 5 * time.Second,
+	}
+	// 发送请求
+	req.Close = true
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("IP %s 端口 %d 测速无效\n", ip, port)
+		return 0
+	}
+	defer resp.Body.Close()
+
+	// 复制响应体到/dev/null，并计算下载速度
+	written, _ := io.Copy(io.Discard, resp.Body)
+	duration := time.Since(startTime)
+	speed := float64(written) / duration.Seconds() / 1024
+
+	// 输出结果
+	fmt.Printf("IP %s 端口 %d 下载速度 %.0f kB/s\n", ip, port, speed)
+	return speed
 }
