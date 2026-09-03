@@ -21,7 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/oschwald/geoip2-golang" // 修正：geoip2-golang 不是 geiop2-golang
+	"github.com/oschwald/geoip2-golang" // 确保这里拼写正确！
 )
 
 const (
