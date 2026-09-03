@@ -21,13 +21,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/oschwald/geoip2-golang"
+	"github.com/oschwald/geoip2-golang" // 修正：geoip2-golang 不是 geiop2-golang
 )
 
 const (
-	requestURL  = "speed.cloudflare.com/cdn-cgi/trace" // 请求trace URL
-	timeout     = 1 * time.Second                      // 超时时间
-	maxDuration = 2 * time.Second                      // 最大持续时间
+	requestURL  = "speed.cloudflare.com/cdn-cgi/trace"
+	timeout     = 1 * time.Second
+	maxDuration = 2 * time.Second
 )
 
 var (
@@ -43,23 +43,23 @@ var (
 )
 
 type result struct {
-	ip          string        // IP地址
-	port        int           // 端口
-	dataCenter  string        // 数据中心
-	locCode     string        // 源IP位置
-	region      string        // 地区
-	city        string        // 城市
-	region_zh   string        // 地区中文
-	country     string        // 国家
-	city_zh     string        // 城市中文
-	emoji       string        // 国旗
-	latency     string        // 延迟
-	tcpDuration time.Duration // TCP请求延迟
+	ip          string
+	port        int
+	dataCenter  string
+	locCode     string
+	region      string
+	city        string
+	region_zh   string
+	country     string
+	city_zh     string
+	emoji       string
+	latency     string
+	tcpDuration time.Duration
 }
 
 type speedtestresult struct {
 	result
-	downloadSpeed float64 // 下载速度
+	downloadSpeed float64
 }
 
 type location struct {
@@ -80,7 +80,6 @@ var (
 	mu        sync.Mutex
 )
 
-// 初始化GeoIP数据库
 func initGeoIP(dbPath string) error {
 	if *disableGeoIP {
 		fmt.Println("GeoIP已禁用")
@@ -100,7 +99,6 @@ func initGeoIP(dbPath string) error {
 	return nil
 }
 
-// 从GeoIP数据库获取IP地理位置
 func getIPLocationFromDB(ipStr string) (country, region, city, countryCode string, err error) {
 	if geoReader == nil {
 		return "", "", "", "", fmt.Errorf("GeoIP数据库未初始化")
@@ -116,7 +114,6 @@ func getIPLocationFromDB(ipStr string) (country, region, city, countryCode strin
 		return "", "", "", "", err
 	}
 
-	// 获取中文名称，如果没有则使用英文
 	city = record.City.Names["zh-CN"]
 	if city == "" {
 		city = record.City.Names["en"]
@@ -139,7 +136,6 @@ func getIPLocationFromDB(ipStr string) (country, region, city, countryCode strin
 	return country, region, city, countryCode, nil
 }
 
-// 尝试提升文件描述符的上限
 func increaseMaxOpenFiles() {
 	fmt.Println("正在尝试提升文件描述符的上限...")
 	cmd := exec.Command("bash", "-c", "ulimit -n 10000")
@@ -153,7 +149,7 @@ func increaseMaxOpenFiles() {
 
 func main() {
 	flag.Parse()
-	var validCount int32 // 有效IP计数器
+	var validCount int32
 
 	startTime := time.Now()
 	osType := runtime.GOOS
@@ -161,7 +157,6 @@ func main() {
 		increaseMaxOpenFiles()
 	}
 
-	// 初始化GeoIP数据库
 	if err := initGeoIP(*geoDBPath); err != nil {
 		fmt.Printf("警告: %v，将使用Cloudflare数据中心信息\n", err)
 	} else if geoReader != nil {
@@ -176,7 +171,6 @@ func main() {
 			fmt.Printf("无法从URL中获取JSON: %v\n", err)
 			return
 		}
-
 		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
@@ -239,7 +233,6 @@ func main() {
 	wg.Add(len(ips))
 
 	resultChan := make(chan result, len(ips))
-
 	thread := make(chan struct{}, *maxThreads)
 
 	var count int
@@ -286,7 +279,7 @@ func main() {
 
 			tcpDuration := time.Since(start)
 			if *delay > 0 && tcpDuration.Milliseconds() > int64(*delay) {
-				return // 超过延迟阈值直接返回（仅在delay>0时生效）
+				return
 			}
 
 			start = time.Now()
@@ -309,8 +302,6 @@ func main() {
 			requestURL := protocol + requestURL
 
 			req, _ := http.NewRequest("GET", requestURL, nil)
-
-			// 添加用户代理
 			req.Header.Set("User-Agent", "Mozilla/5.0")
 			req.Close = true
 			resp, err := client.Do(req)
@@ -325,9 +316,7 @@ func main() {
 
 			defer resp.Body.Close()
 			buf := &bytes.Buffer{}
-			// 创建一个读取操作的超时
 			timeout := time.After(maxDuration)
-			// 使用一个 goroutine 来读取响应体
 			done := make(chan bool)
 			errChan := make(chan error)
 			go func() {
@@ -338,12 +327,9 @@ func main() {
 					return
 				}
 			}()
-			// 等待读取操作完成或者超时
 			select {
 			case <-done:
-				// 读取操作完成
 			case <-timeout:
-				// 读取操作超时
 				return
 			}
 
@@ -356,33 +342,28 @@ func main() {
 				if matches := regexp.MustCompile(`colo=([A-Z]+)[\s\S]*?loc=([A-Z]+)`).FindStringSubmatch(body.String()); len(matches) > 2 {
 					dataCenter := matches[1]
 					locCode := matches[2]
-					
-					// 记录通过延迟检查的有效IP
+
 					atomic.AddInt32(&validCount, 1)
 
-					// 先尝试从GeoIP数据库获取位置信息
 					country, region, city, countryCode, err := getIPLocationFromDB(ipAddr)
-					
+
 					if err == nil && country != "" && !*disableGeoIP {
-						// 使用GeoIP数据
 						emoji := ""
-						// 根据countryCode查找对应的emoji
 						for _, loc := range locations {
 							if loc.Cca2 == countryCode {
 								emoji = loc.Emoji
 								break
 							}
 						}
-						// 如果找不到emoji，尝试从locationMap查找
 						if emoji == "" {
 							if loc, ok := locationMap[dataCenter]; ok {
 								emoji = loc.Emoji
 							}
 						}
 
-						fmt.Printf("发现有效IP %s 端口 %d 位置 %s %s (GeoIP) 延迟 %d 毫秒\n", 
+						fmt.Printf("发现有效IP %s 端口 %d 位置 %s %s (GeoIP) 延迟 %d 毫秒\n",
 							ipAddr, port, city, region, tcpDuration.Milliseconds())
-						
+
 						resultChan <- result{
 							ip:          ipAddr,
 							port:        port,
@@ -398,10 +379,9 @@ func main() {
 							tcpDuration: tcpDuration,
 						}
 					} else {
-						// 使用原有的Cloudflare数据中心信息作为备选
 						loc, ok := locationMap[dataCenter]
 						if ok {
-							fmt.Printf("发现有效IP %s 端口 %d 位置信息 %s (Cloudflare) 延迟 %d 毫秒\n", 
+							fmt.Printf("发现有效IP %s 端口 %d 位置信息 %s (Cloudflare) 延迟 %d 毫秒\n",
 								ipAddr, port, loc.City_zh, tcpDuration.Milliseconds())
 							resultChan <- result{
 								ip:          ipAddr,
@@ -418,7 +398,7 @@ func main() {
 								tcpDuration: tcpDuration,
 							}
 						} else {
-							fmt.Printf("发现有效IP %s 端口 %d 位置信息未知 延迟 %d 毫秒\n", 
+							fmt.Printf("发现有效IP %s 端口 %d 位置信息未知 延迟 %d 毫秒\n",
 								ipAddr, port, tcpDuration.Milliseconds())
 							resultChan <- result{
 								ip:          ipAddr,
@@ -445,7 +425,6 @@ func main() {
 	close(resultChan)
 
 	if len(resultChan) == 0 {
-		// 清除输出内容
 		fmt.Print("\033[2J")
 		fmt.Println("没有发现有效的IP")
 		return
@@ -503,7 +482,6 @@ func main() {
 	}
 	defer file.Close()
 
-	// 写入UTF-8 BOM防止中文乱码
 	_, err = file.WriteString("\xEF\xBB\xBF")
 	if err != nil {
 		fmt.Printf("写入BOM时出现错误: %v\n", err)
@@ -519,46 +497,44 @@ func main() {
 	for _, res := range results {
 		if *speedTest > 0 {
 			writer.Write([]string{
-				res.result.ip, 
-				strconv.Itoa(res.result.port), 
-				strconv.FormatBool(*enableTLS), 
-				res.result.dataCenter, 
-				res.result.locCode, 
-				res.result.region, 
-				res.result.city, 
-				res.result.region_zh, 
-				res.result.country, 
-				res.result.city_zh, 
-				res.result.emoji, 
-				res.result.latency, 
+				res.result.ip,
+				strconv.Itoa(res.result.port),
+				strconv.FormatBool(*enableTLS),
+				res.result.dataCenter,
+				res.result.locCode,
+				res.result.region,
+				res.result.city,
+				res.result.region_zh,
+				res.result.country,
+				res.result.city_zh,
+				res.result.emoji,
+				res.result.latency,
 				fmt.Sprintf("%.0f kB/s", res.downloadSpeed),
 			})
 		} else {
 			writer.Write([]string{
-				res.result.ip, 
-				strconv.Itoa(res.result.port), 
-				strconv.FormatBool(*enableTLS), 
-				res.result.dataCenter, 
-				res.result.locCode, 
-				res.result.region, 
-				res.result.city, 
-				res.result.region_zh, 
-				res.result.country, 
-				res.result.city_zh, 
-				res.result.emoji, 
+				res.result.ip,
+				strconv.Itoa(res.result.port),
+				strconv.FormatBool(*enableTLS),
+				res.result.dataCenter,
+				res.result.locCode,
+				res.result.region,
+				res.result.city,
+				res.result.region_zh,
+				res.result.country,
+				res.result.city_zh,
+				res.result.emoji,
 				res.result.latency,
 			})
 		}
 	}
 
 	writer.Flush()
-	// 清除输出内容
 	fmt.Print("\033[2J")
-	fmt.Printf("有效IP数量: %d | 成功将结果写入文件 %s，耗时 %d秒\n", 
+	fmt.Printf("有效IP数量: %d | 成功将结果写入文件 %s，耗时 %d秒\n",
 		atomic.LoadInt32(&validCount), *outFile, time.Since(startTime)/time.Second)
 }
 
-// 从文件中读取IP地址和端口
 func readIPs(File string) ([]string, error) {
 	file, err := os.Open(File)
 	if err != nil {
@@ -589,7 +565,6 @@ func readIPs(File string) ([]string, error) {
 	return ips, scanner.Err()
 }
 
-// 测速函数
 func getDownloadSpeed(ip string, port int) float64 {
 	var protocol string
 	if *enableTLS {
@@ -598,11 +573,9 @@ func getDownloadSpeed(ip string, port int) float64 {
 		protocol = "http://"
 	}
 	speedTestURL := protocol + *speedTestURL
-	// 创建请求
 	req, _ := http.NewRequest("GET", speedTestURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
-	// 创建TCP连接
 	dialer := &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 0,
@@ -615,17 +588,14 @@ func getDownloadSpeed(ip string, port int) float64 {
 
 	fmt.Printf("正在测试IP %s 端口 %d\n", ip, port)
 	startTime := time.Now()
-	// 创建HTTP客户端
 	client := http.Client{
 		Transport: &http.Transport{
 			Dial: func(network, addr string) (net.Conn, error) {
 				return conn, nil
 			},
 		},
-		//设置单个IP测速最长时间为5秒
 		Timeout: 5 * time.Second,
 	}
-	// 发送请求
 	req.Close = true
 	resp, err := client.Do(req)
 	if err != nil {
@@ -634,12 +604,10 @@ func getDownloadSpeed(ip string, port int) float64 {
 	}
 	defer resp.Body.Close()
 
-	// 复制响应体到/dev/null，并计算下载速度
 	written, _ := io.Copy(io.Discard, resp.Body)
 	duration := time.Since(startTime)
 	speed := float64(written) / duration.Seconds() / 1024
 
-	// 输出结果
 	fmt.Printf("IP %s 端口 %d 下载速度 %.0f kB/s\n", ip, port, speed)
 	return speed
 }
